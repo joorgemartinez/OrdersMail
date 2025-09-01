@@ -6,11 +6,13 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
 from pathlib import Path
-from dotenv import load_dotenv
 
-# --- Cargar .env ---
-env_path = Path(__file__).with_name(".env")
-load_dotenv(env_path)
+# Carga .env si existe (útil en local). En GitHub Actions leerá de os.environ (secrets).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).with_name(".env"))
+except Exception:
+    pass
 
 # --- Config ---
 API_KEY     = os.getenv("HOLDED_API_KEY")
@@ -26,10 +28,14 @@ SMTP_PASS   = os.getenv("SMTP_PASS")
 BASE_URL   = "https://api.holded.com/api/invoicing/v1/documents/salesorder"
 PAGE_LIMIT = 200
 
+# Zona horaria Madrid (necesita tzdata instalado en el entorno)
+from zoneinfo import ZoneInfo
+TZ_MADRID = ZoneInfo("Europe/Madrid")
+
 # --- Helpers API ---
 def headers():
     if not API_KEY:
-        raise SystemExit("ERROR: falta HOLDED_API_KEY en .env")
+        raise SystemExit("ERROR: falta HOLDED_API_KEY en variables de entorno")
     h = {"Accept": "application/json"}
     if USE_BEARER:
         h["Authorization"] = f"Bearer {API_KEY}"
@@ -44,25 +50,28 @@ def fmt_eur(n):
         return str(n)
     return f"{v:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
 
-def today_bounds_epoch_seconds_local():
+def madrid_today_bounds_epoch_seconds():
     """
-    00:00–23:59:59 del día local -> epoch SEGUNDOS (en UTC).
-    Funciona en tu Windows (Madrid) sin tzdata adicional.
+    00:00–23:59:59 del día HOY en Europe/Madrid -> epoch segundos (UTC).
     """
-    now_local = datetime.now()
-    start_local = datetime(now_local.year, now_local.month, now_local.day, 0, 0, 0).astimezone()
-    end_local   = datetime(now_local.year, now_local.month, now_local.day, 23, 59, 59).astimezone()
-    start_utc = start_local.astimezone(timezone.utc)
-    end_utc   = end_local.astimezone(timezone.utc)
+    now_mad = datetime.now(TZ_MADRID)
+    start_mad = datetime(now_mad.year, now_mad.month, now_mad.day, 0, 0, 0, tzinfo=TZ_MADRID)
+    end_mad   = datetime(now_mad.year, now_mad.month, now_mad.day, 23, 59, 59, tzinfo=TZ_MADRID)
+    start_utc = start_mad.astimezone(timezone.utc)
+    end_utc   = end_mad.astimezone(timezone.utc)
     return int(start_utc.timestamp()), int(end_utc.timestamp())
 
+def madrid_today_label():
+    return datetime.now(TZ_MADRID).strftime("%d/%m/%Y")
+
 def fetch_today_orders():
-    start_s, end_s = today_bounds_epoch_seconds_local()
+    start_s, end_s = madrid_today_bounds_epoch_seconds()
     orders = []
     page = 1
     while True:
-        params = {"page": page, "limit": PAGE_LIMIT, "starttmp": str(start_s), "endtmp": str(end_s)}
-        r = requests.get(BASE_URL, headers=headers(), params=params)
+        params = {"page": page, "limit": PAGE_LIMIT,
+                  "starttmp": str(start_s), "endtmp": str(end_s)}
+        r = requests.get(BASE_URL, headers=headers(), params=params, timeout=60)
         if r.status_code == 401:
             raise SystemExit(f"401 Unauthorized: {r.text}")
         r.raise_for_status()
@@ -77,7 +86,7 @@ def fetch_today_orders():
 
 def epoch_to_local_str(s):
     try:
-        return datetime.fromtimestamp(int(s), tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(int(s), tz=timezone.utc).astimezone(TZ_MADRID).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(s)
 
@@ -121,7 +130,7 @@ def send_email(subject, html):
         "SMTP_PORT":SMTP_PORT, "SMTP_USER":SMTP_USER, "SMTP_PASS":SMTP_PASS
     }.items() if not v]
     if missing:
-        raise SystemExit(f"Faltan variables SMTP en .env: {', '.join(missing)}")
+        raise SystemExit(f"Faltan variables SMTP en entorno: {', '.join(missing)}")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -129,16 +138,16 @@ def send_email(subject, html):
     msg["To"] = MAIL_TO
     msg.attach(MIMEText(html, "html"))
 
-    recipients = [e.strip() for e in MAIL_TO.split(",") if e.strip()]
+    recipients = [e.strip() for e in (MAIL_TO or "").split(",") if e.strip()]
 
     try:
         if SMTP_PORT == 465:
             context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as server:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=60) as server:
                 server.login(SMTP_USER, SMTP_PASS)
                 server.sendmail(MAIL_FROM, recipients, msg.as_string())
         else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()
@@ -152,13 +161,13 @@ def send_email(subject, html):
 
 # --- Main ---
 def main():
-    date_label = datetime.now().strftime("%d/%m/%Y")
+    date_label = madrid_today_label()
     orders = fetch_today_orders()
 
     print(f"Pedidos de HOY ({date_label}): {len(orders)}\n")
     if not orders:
         print("No hay pedidos hoy.")
-        # Si NO quieres enviar email cuando no haya pedidos, comenta estas 3 líneas:
+        # Si NO quieres email cuando no haya pedidos, comenta estas 3 líneas:
         html = build_html_table(orders, date_label, 0.0)
         subject = f"Pedidos de HOY (0) — {date_label}"
         send_email(subject, html)
@@ -169,7 +178,7 @@ def main():
     for d in orders:
         number   = d.get("number") or d.get("code") or d.get("serial") or "-"
         customer = (d.get("customer") or {}).get("name") or d.get("contactName") or "-"
-        total    = float(d.get("total", 0) or 0)   # euros
+        total    = float(d.get("total", 0) or 0)
         fecha    = d.get("date") or d.get("createdAt") or d.get("issuedOn") or d.get("updatedAt") or "-"
         fecha_hr = epoch_to_local_str(fecha) if str(fecha).isdigit() else fecha
         total_day += total
