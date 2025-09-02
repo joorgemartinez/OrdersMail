@@ -1,0 +1,97 @@
+{
+  "id": "68a56a06499062da7f06cdea",
+  "contact": "656ed5ca494978d43202c2b7",
+  "contactName": "Umeg SL",
+  "desc": "",
+  "date": 1755640800,
+  "dueDate": null,
+  "multipledueDate": [],
+  "forecastDate": null,
+  "notes": "Nº RII-AEE 9578– RD 110/2015   \nENV/2023/000013015",
+  "tags": [
+    "605",
+    "aiko",
+    "canet",
+    "transporte"
+  ],
+  "products": [
+    {
+      "name": "AIKO-A605-A-MAH72Mw 30mm",
+      "desc": "AIKO módulo N-Type ABC Mono glass 605W 350mm Cable Marco de 30mm",
+      "price": 68.365,
+      "units": 36,
+      "projectid": null,
+      "tax": 21,
+      "taxes": [
+        "s_iva_21"
+      ],
+      "tags": [
+        "605",
+        "aiko",
+        "canet"
+      ],
+      "discount": 0,
+      "retention": 0,
+      "weight": 14.05,
+      "costPrice": 268.77,
+      "sku": "AIKO-A605-A-MAH72Mw 30mm",
+      "account": "5b88760fbfcd4139e00bea57",
+      "productId": "672ce44b9dab62a1bf017782",
+      "variantId": "672ce44b9dab62a1bf017783"
+    },
+    {
+      "name": "Transporte",
+      "desc": "Envío, Manipulación y Embalaje (Cliente posee medios de descarga en destino)",
+      "price": 125,
+      "units": 1,
+      "projectid": null,
+      "tax": 21,
+      "taxes": [
+        "s_iva_21"
+      ],
+      "tags": [
+        "canet",
+        "transporte"
+      ],
+      "discount": 0,
+      "retention": 0,
+      "weight": 0,
+      "costPrice": 0,
+      "sku": 0,
+      "account": "5b88760fbfcd4139e00bea57",
+      "serviceId": "5c338fdfa265642ba34f74f0"
+    }
+  ],
+  "tax": 543.09,
+  "subtotal": 2586.14,
+  "discount": 0,
+  "total": 3129.23,
+  "language": "es",
+  "status": 1,
+  "customFields": [
+    {
+      "field": "Incoterm",
+      "value": "DAP GRANADA"
+    },
+    {
+      "field": "Forma de pago",
+      "value": "Confirming 30 días"
+    },
+    {
+      "field": "ENV/2023/000013015",
+      "value": ""
+    }
+  ],
+  "docNumber": "PV25L596",
+  "currency": "eur",
+  "currencyChange": 1,
+  "trackingkey": null,
+  "trackingname": null,
+  "trackingnum": null,
+  "pickupdate": null,
+  "deliverydate": null,
+  "internalnotes": null,
+  "warehouse": "62b3330ef8a11e75ea03f8bb",
+  "shipping": "manual",
+  "shippingData": "Calle Escritor Antonio Almagro 12,\n\nGranada , 18015\nGranada , España\n\ncontacto . Antonio  666592348"
+}
