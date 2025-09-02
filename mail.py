@@ -4,7 +4,7 @@ import ssl
 import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # Carga .env si existe (útil en local). En GitHub Actions leerá de os.environ (secrets).
@@ -50,22 +50,23 @@ def fmt_eur(n):
         return str(n)
     return f"{v:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
 
-def madrid_today_bounds_epoch_seconds():
+def madrid_yesterday_bounds_epoch_seconds():
     """
-    00:00–23:59:59 del día HOY en Europe/Madrid -> epoch segundos (UTC).
+    00:00–23:59:59 de AYER en Europe/Madrid -> epoch segundos (UTC).
     """
     now_mad = datetime.now(TZ_MADRID)
-    start_mad = datetime(now_mad.year, now_mad.month, now_mad.day, 0, 0, 0, tzinfo=TZ_MADRID)
-    end_mad   = datetime(now_mad.year, now_mad.month, now_mad.day, 23, 59, 59, tzinfo=TZ_MADRID)
+    ayer = now_mad - timedelta(days=1)
+    start_mad = datetime(ayer.year, ayer.month, ayer.day, 0, 0, 0, tzinfo=TZ_MADRID)
+    end_mad   = datetime(ayer.year, ayer.month, ayer.day, 23, 59, 59, tzinfo=TZ_MADRID)
     start_utc = start_mad.astimezone(timezone.utc)
     end_utc   = end_mad.astimezone(timezone.utc)
     return int(start_utc.timestamp()), int(end_utc.timestamp())
 
-def madrid_today_label():
-    return datetime.now(TZ_MADRID).strftime("%d/%m/%Y")
+def madrid_yesterday_label():
+    return (datetime.now(TZ_MADRID) - timedelta(days=1)).strftime("%d/%m/%Y")
 
-def fetch_today_orders():
-    start_s, end_s = madrid_today_bounds_epoch_seconds()
+def fetch_yesterday_orders():
+    start_s, end_s = madrid_yesterday_bounds_epoch_seconds()
     orders = []
     page = 1
     while True:
@@ -93,13 +94,13 @@ def epoch_to_local_str(s):
 # --- HTML ---
 def build_html_table(orders, date_label, total_day):
     if not orders:
-        return f"<p>No hay pedidos hoy ({date_label}).</p>"
+        return f"<p>No hay pedidos AYER ({date_label}).</p>"
 
     rows = []
     for d in orders:
         number   = d.get("number") or d.get("code") or d.get("serial") or "-"
         customer = (d.get("customer") or {}).get("name") or d.get("contactName") or "-"
-        total    = float(d.get("total", 0) or 0)  # euros (confirmado en tu tenant)
+        total    = float(d.get("total", 0) or 0)  # euros
         fecha    = d.get("date") or d.get("createdAt") or d.get("issuedOn") or d.get("updatedAt") or "-"
         fecha_hr = epoch_to_local_str(fecha) if str(fecha).isdigit() else fecha
         rows.append(
@@ -114,7 +115,7 @@ def build_html_table(orders, date_label, total_day):
     rows_html = "\n".join(rows)
     return f"""
     <div style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif">
-      <h3 style="margin:0 0 8px">Pedidos de HOY — {date_label}</h3>
+      <h3 style="margin:0 0 8px">Pedidos de AYER — {date_label}</h3>
       <p style="margin:0 0 12px">Total pedidos: <b>{len(orders)}</b> &nbsp;|&nbsp; Importe total: <b>{fmt_eur(total_day)}</b></p>
       <table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse">
         <thead><tr><th>Nº</th><th>Cliente</th><th>Total</th><th>Fecha</th></tr></thead>
@@ -161,15 +162,15 @@ def send_email(subject, html):
 
 # --- Main ---
 def main():
-    date_label = madrid_today_label()
-    orders = fetch_today_orders()
+    date_label = madrid_yesterday_label()
+    orders = fetch_yesterday_orders()
 
-    print(f"Pedidos de HOY ({date_label}): {len(orders)}\n")
+    print(f"Pedidos de AYER ({date_label}): {len(orders)}\n")
     if not orders:
-        print("No hay pedidos hoy.")
+        print("No hubo pedidos ayer.")
         # Si NO quieres email cuando no haya pedidos, comenta estas 3 líneas:
         html = build_html_table(orders, date_label, 0.0)
-        subject = f"Pedidos de HOY (0) — {date_label}"
+        subject = f"Pedidos de AYER (0) — {date_label}"
         send_email(subject, html)
         print("Email enviado (0 pedidos).")
         return
@@ -185,11 +186,11 @@ def main():
         print(f"{number:>12} | {customer} | {fmt_eur(total):>12} | {fecha_hr}")
 
     print("\n" + "-"*60)
-    print(f"TOTAL del día: {fmt_eur(total_day)}")
+    print(f"TOTAL del día (AYER): {fmt_eur(total_day)}")
     print("-"*60)
 
     html = build_html_table(orders, date_label, total_day)
-    subject = f"Pedidos de HOY ({len(orders)}) — {date_label} — Total {fmt_eur(total_day)}"
+    subject = f"Pedidos de AYER ({len(orders)}) — {date_label} — Total {fmt_eur(total_day)}"
     send_email(subject, html)
     print("Email enviado.")
 
