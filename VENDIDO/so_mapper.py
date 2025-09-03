@@ -289,7 +289,7 @@ def infer_units_per_pallet(product, *, name="", sku="", qty=0):
 
 # ----------------------------- Render/Debug -----------------------------
 def build_row(doc, line):
-    """Crea la fila con precio €/W SI hay potencia; si no, precio unitario €/ud."""
+    """Crea la fila con precio €/W SI hay potencia; si no, precio unitario €/ud. Pallets solo si hay potencia."""
     cliente_name = doc.get("contactName") or "-"
     item_name = line["name"] or "-"
     qty = float(line["qty"] or 0)
@@ -303,12 +303,19 @@ def build_row(doc, line):
             product = {}
 
     power_w = extract_power_w(product, item_name=item_name, item_sku=line.get("sku",""))
-    upp, _, _, leftover = infer_units_per_pallet(product, name=item_name, sku=line.get("sku",""), qty=int(qty))
-    pallets = math.ceil(qty / upp) if (qty > 0 and upp > 0) else "-"
-    pallets_display = (
-        f"{int(pallets)} (+{leftover})" if (isinstance(pallets, (int,float)) and leftover)
-        else (str(int(pallets)) if pallets != "-" else "-")
-    )
+
+    # Pallets: SOLO si hay potencia (p.ej., paneles). Si no, "-"
+    if power_w:
+        upp, _, _, leftover = infer_units_per_pallet(
+            product, name=item_name, sku=line.get("sku",""), qty=int(qty)
+        )
+        pallets = math.ceil(qty / upp) if (qty > 0 and upp > 0) else "-"
+        pallets_display = (
+            f"{int(pallets)} (+{leftover})" if (isinstance(pallets, (int,float)) and leftover)
+            else (str(int(pallets)) if pallets != "-" else "-")
+        )
+    else:
+        pallets_display = "-"
 
     # Precio dinámico
     if power_w:
@@ -338,7 +345,6 @@ def _display_rows_for_console(rows):
     disp = []
     for r in rows:
         precio_txt = fmt_eur(r["PrecioValor"], r["PrecioDecs"])
-        # reemplaza " €" por " €/W" o " €/ud"
         precio_txt = precio_txt.replace(" €", f" {r['PrecioUnidad']}")
         if isinstance(r["Transporte"], (int,float)):
             transp_txt = fmt_eur(r["Transporte"], 2)
