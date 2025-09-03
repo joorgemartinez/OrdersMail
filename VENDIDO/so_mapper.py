@@ -39,7 +39,7 @@ except Exception:
     TZ_MADRID = None  # si no hay tzdata, imprimimos en local/UTC
 
 # Preferencias de pack
-POSSIBLE_PACK_SIZES = [36, 37, 35, 31, 30]  # orden con ligera preferencia por 36
+POSSIBLE_PACK_SIZES = [36, 37, 35, 31, 30,33]  # orden con ligera preferencia por 36
 PACK_RULES = [
     (r"AIKO.*MAH72M", 36),
     (r"AIKO.*\b605\b", 36),
