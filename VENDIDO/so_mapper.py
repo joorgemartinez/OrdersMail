@@ -8,7 +8,6 @@ import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-
 # --- .env local opcional ---
 try:
     from dotenv import load_dotenv
@@ -39,7 +38,7 @@ except Exception:
     TZ_MADRID = None  # si no hay tzdata, imprimimos en local/UTC
 
 # Preferencias de pack
-POSSIBLE_PACK_SIZES = [36, 37, 35, 31, 30,33]  # orden con ligera preferencia por 36
+POSSIBLE_PACK_SIZES = [36, 37, 35, 33, 31, 30]  # añadido 33; ligera preferencia por 36
 PACK_RULES = [
     (r"AIKO.*MAH72M", 36),
     (r"AIKO.*\b605\b", 36),
@@ -83,7 +82,6 @@ def get_salesorder(doc_id):
     url = f"{BASE_DOCS}/salesorder/{doc_id}"
     r = requests.get(url, headers=H(), timeout=60)
     if r.status_code == 404:
-        # fallback por si en tu cuenta el endpoint genérico trae el detalle
         url = f"{BASE_DOCS}/{doc_id}"
         r = requests.get(url, headers=H(), timeout=60)
     r.raise_for_status()
@@ -138,18 +136,15 @@ def try_fields(container, candidates, default=None):
     if not isinstance(container, dict):
         return default
     for key in candidates:
-        # plano
         if key in container:
             val = container[key]
             if val not in (None, "", []):
                 return val
-        # attributes
         attrs = container.get("attributes") or {}
         if key in attrs:
             val = attrs.get(key)
             if val not in (None, "", []):
                 return val
-        # customFields puede venir como lista de {field, value} o dict
         cfs = container.get("customFields")
         if isinstance(cfs, dict) and key in cfs:
             val = cfs.get(key)
@@ -170,7 +165,6 @@ def extract_power_w(product, *, item_name="", item_sku=""):
     2) Textos con 'W': 605W, 605 W, 605Wp...
     3) Números 3–4 cifras sueltos (p.ej., 'A605'), filtrados 300..1000 W.
     """
-    # 1) Producto
     val = try_fields(product, ["power_w", "Potencia", "potencia_w", "power", "watt", "W"])
     if val not in (None, "", []):
         try:
@@ -184,15 +178,12 @@ def extract_power_w(product, *, item_name="", item_sku=""):
         str(try_fields(product, ["name"]) or ""),
         str(try_fields(product, ["sku"]) or ""),
     ]
-
-    # 2) Con 'W' explícita
     for txt in texts:
         m = re.findall(r"(?<!\d)(\d{3,4})\s*[Ww]\s*(?:[Pp])?", txt)
         cands = [int(x) for x in m if 300 <= int(x) <= 1000]
         if cands:
             return float(max(cands))
 
-    # 3) Números sueltos 3–4 cifras
     generic = []
     for txt in texts:
         for x in re.findall(r"(?<!\d)(\d{3,4})(?!\d)", txt):
@@ -201,11 +192,9 @@ def extract_power_w(product, *, item_name="", item_sku=""):
                 generic.append(n)
     if generic:
         return float(max(generic))
-
     return 0.0
 
 def extract_units_per_pallet(product):
-    """Uds/pallet en attributes/customFields con claves comunes."""
     val = try_fields(product, [
         "units_per_pallet", "unitsPerPallet", "pallet_units",
         "ud_pallet", "uds_pallet", "unitsPallet"
@@ -221,10 +210,6 @@ def compute_price_per_w(line_amount, qty, power_w):
     return 0.0
 
 def extract_transport_amount_from_doc(doc):
-    """
-    Devuelve el IMPORTE de transporte (sumatorio price*units) si existen
-    líneas de 'Transporte' en doc['products']. Si no, '-'.
-    """
     total = 0.0
     found = False
     for p in (doc.get("products") or []):
@@ -245,10 +230,6 @@ def to_date_label(doc):
 
 # ----------------------------- Normalización de líneas -----------------------------
 def iter_document_lines(doc):
-    """
-    Devuelve líneas normalizadas desde doc['products'] (estructura de tu tenant).
-    Omite la línea de Transporte para la tabla de materiales.
-    """
     for it in (doc.get("products") or []):
         name = (it.get("name") or "").strip()
         is_transport = name.lower() == "transporte" or "transporte" in [t.lower() for t in (it.get("tags") or [])]
@@ -276,39 +257,28 @@ def hint_units_per_pallet_by_pattern(name="", sku="", product=None):
     return 0.0
 
 def infer_units_per_pallet(product, *, name="", sku="", qty=0):
-    """
-    Devuelve (units_per_pallet, source, ambiguous_candidates, leftover)
-    source ∈ {"attr","pattern","divisible","ambiguous_divisible","closest","unknown"}
-    """
-    # 1) atributo explícito en producto
-    upp = extract_units_per_pallet(product)
-    if upp > 0:
+    if (upp := extract_units_per_pallet(product)) > 0:
         leftover = qty % upp if qty and upp else 0
         return upp, "attr", [], int(leftover)
 
-    # 2) patrón por nombre/sku
     upp = hint_units_per_pallet_by_pattern(name=name, sku=sku, product=product)
     if upp > 0:
         leftover = qty % upp if qty and upp else 0
         return upp, "pattern", [], int(leftover)
 
-    # 3) divisibilidad exacta en la lista plausible
     if qty:
         exact = [p for p in POSSIBLE_PACK_SIZES if qty % p == 0]
         if len(exact) == 1:
             return float(exact[0]), "divisible", [], 0
         elif len(exact) > 1:
-            # Empate: preferimos 36 si está; si no, el mayor
             preferred = 36 if 36 in exact else max(exact)
             others = [p for p in exact if p != preferred]
             return float(preferred), "ambiguous_divisible", others, 0
 
-        # 4) ningún divisor exacto → el más cercano (mínimo sobrante)
         best_p = None
         best_leftover = None
         for p in POSSIBLE_PACK_SIZES:
             rem = qty % p
-            # métrica simple: sobrante mínimo; como desempate, el mayor p
             score = (rem, -p)
             if best_leftover is None or score < (best_leftover, -best_p):
                 best_leftover = rem
@@ -319,7 +289,7 @@ def infer_units_per_pallet(product, *, name="", sku="", qty=0):
 
 # ----------------------------- Render/Debug -----------------------------
 def build_row(doc, line):
-    """Crea la fila de la tabla con tus columnas a partir de una línea (no transporte)."""
+    """Crea la fila con precio €/W SI hay potencia; si no, precio unitario €/ud."""
     cliente_name = doc.get("contactName") or "-"
     item_name = line["name"] or "-"
     qty = float(line["qty"] or 0)
@@ -333,17 +303,22 @@ def build_row(doc, line):
             product = {}
 
     power_w = extract_power_w(product, item_name=item_name, item_sku=line.get("sku",""))
-    upp, upp_source, upp_amb, leftover = infer_units_per_pallet(
-        product, name=item_name, sku=line.get("sku",""), qty=int(qty)
-    )
+    upp, _, _, leftover = infer_units_per_pallet(product, name=item_name, sku=line.get("sku",""), qty=int(qty))
     pallets = math.ceil(qty / upp) if (qty > 0 and upp > 0) else "-"
     pallets_display = (
         f"{int(pallets)} (+{leftover})" if (isinstance(pallets, (int,float)) and leftover)
         else (str(int(pallets)) if pallets != "-" else "-")
     )
 
-    precio_w = compute_price_per_w(amount, qty, power_w)
-    transporte_amount = extract_transport_amount_from_doc(doc)
+    # Precio dinámico
+    if power_w:
+        precio_valor = compute_price_per_w(amount, qty, power_w)   # €/W
+        precio_unidad = "€/W"
+        decs = 4
+    else:
+        precio_valor = float(line.get("unit_price") or 0)          # €/ud
+        precio_unidad = "€/ud"
+        decs = 2
 
     return {
         "Fecha reserva": to_date_label(doc),
@@ -352,29 +327,48 @@ def build_row(doc, line):
         "Cantidad uds": int(qty),
         "Nº Pallets": pallets_display,
         "Cliente": (cliente_name or "-"),
-        "Precio €/W": precio_w,          # se formatea al imprimir
-        "Transporte": transporte_amount  # importe total (€) o '-'
+        "PrecioValor": precio_valor,   # número
+        "PrecioUnidad": precio_unidad, # "€/W" o "€/ud"
+        "PrecioDecs": decs,            # 4 si €/W, 2 si €/ud
+        "Transporte": "-"              # se rellenará solo en la PRIMERA fila
     }
+
+def _display_rows_for_console(rows):
+    """Prepara filas de texto ya formateadas para impresión en consola."""
+    disp = []
+    for r in rows:
+        precio_txt = fmt_eur(r["PrecioValor"], r["PrecioDecs"])
+        # reemplaza " €" por " €/W" o " €/ud"
+        precio_txt = precio_txt.replace(" €", f" {r['PrecioUnidad']}")
+        if isinstance(r["Transporte"], (int,float)):
+            transp_txt = fmt_eur(r["Transporte"], 2)
+        else:
+            transp_txt = str(r["Transporte"])
+        disp.append({
+            "Fecha reserva": str(r["Fecha reserva"]),
+            "Material": str(r["Material"]),
+            "Potencia (W)": str(r["Potencia (W)"]),
+            "Cantidad uds": str(r["Cantidad uds"]),
+            "Nº Pallets": str(r["Nº Pallets"]),
+            "Cliente": str(r["Cliente"]),
+            "Precio": precio_txt,
+            "Transporte": transp_txt
+        })
+    return disp
 
 def print_table(rows):
     if not rows:
         print("No hay líneas que mostrar.")
         return
-    headers = ["Fecha reserva","Material","Potencia (W)","Cantidad uds","Nº Pallets","Cliente","Precio €/W","Transporte"]
-    def fmt(v, k=None):
-        # Formatea como € tanto el Precio €/W (valor unitario, 4 dec) como el Transporte (importe, 2 dec)
-        if k == "Precio €/W" and isinstance(v, (int,float)):
-            return fmt_eur(v, decimals=4)
-        if k == "Transporte" and isinstance(v, (int,float)):
-            return fmt_eur(v, decimals=2)
-        return str(v)
-    widths = {h: max(len(h), max(len(fmt(r[h], h)) for r in rows)) for h in headers}
+    headers = ["Fecha reserva","Material","Potencia (W)","Cantidad uds","Nº Pallets","Cliente","Precio","Transporte"]
+    disp = _display_rows_for_console(rows)
+    widths = {h: max(len(h), max(len(d[h]) for d in disp)) for h in headers}
     sep = " | "
     line = "-+-".join("-"*widths[h] for h in headers)
     print(sep.join(h.ljust(widths[h]) for h in headers))
     print(line)
-    for r in rows:
-        print(sep.join(fmt(r[h], h).ljust(widths[h]) for h in headers))
+    for d in disp:
+        print(sep.join(d[h].ljust(widths[h]) for h in headers))
 
 def dump_json(obj, path):
     path = Path(path)
@@ -388,19 +382,17 @@ def build_html_table(doc, rows):
     fecha = to_date_label(doc)
     transporte_amount = extract_transport_amount_from_doc(doc)
 
-    # cabecera
     head = (
         f"<h3 style='margin:0 0 8px'>Reserva de material — Pedido {number}</h3>"
         f"<p style='margin:0 0 10px'>Cliente: <b>{cliente}</b> &nbsp;|&nbsp; Fecha: <b>{fecha}</b>"
         f" &nbsp;|&nbsp; Transporte: <b>{(fmt_eur(transporte_amount,2) if isinstance(transporte_amount,(int,float)) else transporte_amount)}</b></p>"
     )
 
-    headers = ["Fecha reserva","Material","Potencia (W)","Cantidad uds","Nº Pallets","Cliente","Precio €/W","Transporte"]
-    # filas
+    headers = ["Fecha reserva","Material","Potencia (W)","Cantidad uds","Nº Pallets","Cliente","Precio","Transporte"]
     tr = []
     for r in rows:
-        precio_w = fmt_eur(r["Precio €/W"], 4) if isinstance(r["Precio €/W"], (int,float)) else r["Precio €/W"]
-        transporte = fmt_eur(r["Transporte"], 2) if isinstance(r["Transporte"], (int,float)) else r["Transporte"]
+        precio_html = fmt_eur(r["PrecioValor"], r["PrecioDecs"]).replace(" €", f" {r['PrecioUnidad']}")
+        transp_html = fmt_eur(r["Transporte"], 2) if isinstance(r["Transporte"], (int,float)) else r["Transporte"]
         tr.append(
             "<tr>"
             f"<td>{r['Fecha reserva']}</td>"
@@ -409,8 +401,8 @@ def build_html_table(doc, rows):
             f"<td style='text-align:right'>{r['Cantidad uds']}</td>"
             f"<td style='text-align:right'>{r['Nº Pallets']}</td>"
             f"<td>{r['Cliente']}</td>"
-            f"<td style='text-align:right'>{precio_w}</td>"
-            f"<td style='text-align:right'>{transporte}</td>"
+            f"<td style='text-align:right'>{precio_html}</td>"
+            f"<td style='text-align:right'>{transp_html}</td>"
             "</tr>"
         )
     body = (
@@ -422,10 +414,7 @@ def build_html_table(doc, rows):
         "</table>"
     )
 
-    return (
-        "<div style='font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif'>"
-        + head + body + "</div>"
-    )
+    return "<div style='font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif'>" + head + body + "</div>"
 
 def send_email(subject, html):
     missing = [k for k,v in {
@@ -464,7 +453,7 @@ def send_email(subject, html):
 
 # ----------------------------- Main -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Mapeador de Sales Orders (Holded) → tabla de reserva (+ email opcional)")
+    ap = argparse.ArgumentParser(description="Mapeador de Sales Orders (Holded) → reserva (+ email opcional)")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--doc-id", help="ID de documento (salesorder) a descargar")
     g.add_argument("--minutes", type=int, help="Buscar pedidos creados en los últimos X minutos")
@@ -497,11 +486,16 @@ def main():
         if args.dump_json:
             dump_json(doc, f"{args.dump_json.rstrip('.json')}_{doc_id}.json")
 
-        # Normaliza líneas desde 'products' y filtra la línea de transporte
         lines = list(iter_document_lines(doc))
         material_lines = [ln for ln in lines if not ln.get("is_transport")]
 
         rows = [build_row(doc, ln) for ln in material_lines]
+
+        # Transporte global solo en la PRIMERA fila
+        transp_amount = extract_transport_amount_from_doc(doc)
+        for i, r in enumerate(rows):
+            r["Transporte"] = transp_amount if i == 0 else "-"
+
         print_table(rows)
 
         if args.send_email:

@@ -6,6 +6,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
 
 # Carga .env si existe (útil en local). En GitHub Actions leerá de os.environ (secrets).
 try:
