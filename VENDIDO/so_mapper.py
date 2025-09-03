@@ -1,10 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import os, sys, json, math, re, argparse
+import os, sys, json, math, re, argparse, ssl, smtplib
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import requests
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
 
 # --- .env local opcional ---
 try:
@@ -16,6 +19,13 @@ except Exception:
 # --- Config ---
 API_KEY     = os.getenv("HOLDED_API_KEY")
 USE_BEARER  = os.getenv("HOLDED_USE_BEARER", "false").lower() in ("1","true","yes")
+
+MAIL_FROM   = os.getenv("MAIL_FROM")
+MAIL_TO     = os.getenv("MAIL_TO")      # varios separados por coma
+SMTP_HOST   = os.getenv("SMTP_HOST")
+SMTP_PORT   = int(os.getenv("SMTP_PORT", "587"))  # 587 STARTTLS | 465 SSL
+SMTP_USER   = os.getenv("SMTP_USER")
+SMTP_PASS   = os.getenv("SMTP_PASS")
 
 BASE_DOCS   = "https://api.holded.com/api/invoicing/v1/documents"
 BASE_PROD   = "https://api.holded.com/api/invoicing/v1/products"
@@ -60,12 +70,13 @@ def utc_bounds_last_minutes(minutes=10, tz=TZ_MADRID):
     start = now_tz - timedelta(minutes=minutes)
     return int(start.astimezone(timezone.utc).timestamp()), int(now_tz.astimezone(timezone.utc).timestamp())
 
-def fmt_eur(n):
+def fmt_eur(n, decimals=4):
     try:
         v = float(n or 0)
     except Exception:
         return str(n)
-    return f"{v:,.4f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+    s = f"{v:,.{decimals}f} €"
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
 # ----------------------------- API calls -----------------------------
 def get_salesorder(doc_id):
@@ -340,9 +351,9 @@ def build_row(doc, line):
         "Potencia (W)": int(power_w) if power_w else "-",
         "Cantidad uds": int(qty),
         "Nº Pallets": pallets_display,
-        "Cliente": cliente_name,
-        "Precio €/W": precio_w,         # se formatea al imprimir
-        "Transporte": transporte_amount # importe total (€) o '-'
+        "Cliente": (cliente_name or "-"),
+        "Precio €/W": precio_w,          # se formatea al imprimir
+        "Transporte": transporte_amount  # importe total (€) o '-'
     }
 
 def print_table(rows):
@@ -351,9 +362,11 @@ def print_table(rows):
         return
     headers = ["Fecha reserva","Material","Potencia (W)","Cantidad uds","Nº Pallets","Cliente","Precio €/W","Transporte"]
     def fmt(v, k=None):
-        # Formatea como € tanto el Precio €/W (valor unitario) como el Transporte (importe)
-        if k in ("Precio €/W", "Transporte") and isinstance(v, (int,float)):
-            return fmt_eur(v)
+        # Formatea como € tanto el Precio €/W (valor unitario, 4 dec) como el Transporte (importe, 2 dec)
+        if k == "Precio €/W" and isinstance(v, (int,float)):
+            return fmt_eur(v, decimals=4)
+        if k == "Transporte" and isinstance(v, (int,float)):
+            return fmt_eur(v, decimals=2)
         return str(v)
     widths = {h: max(len(h), max(len(fmt(r[h], h)) for r in rows)) for h in headers}
     sep = " | "
@@ -368,14 +381,96 @@ def dump_json(obj, path):
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[dump] JSON guardado en: {path}")
 
+# ----------------------------- Email -----------------------------
+def build_html_table(doc, rows):
+    number = doc.get("number") or doc.get("code") or doc.get("docNumber") or (doc.get("_id") or doc.get("id") or "-")
+    cliente = doc.get("contactName") or "-"
+    fecha = to_date_label(doc)
+    transporte_amount = extract_transport_amount_from_doc(doc)
+
+    # cabecera
+    head = (
+        f"<h3 style='margin:0 0 8px'>Reserva de material — Pedido {number}</h3>"
+        f"<p style='margin:0 0 10px'>Cliente: <b>{cliente}</b> &nbsp;|&nbsp; Fecha: <b>{fecha}</b>"
+        f" &nbsp;|&nbsp; Transporte: <b>{(fmt_eur(transporte_amount,2) if isinstance(transporte_amount,(int,float)) else transporte_amount)}</b></p>"
+    )
+
+    headers = ["Fecha reserva","Material","Potencia (W)","Cantidad uds","Nº Pallets","Cliente","Precio €/W","Transporte"]
+    # filas
+    tr = []
+    for r in rows:
+        precio_w = fmt_eur(r["Precio €/W"], 4) if isinstance(r["Precio €/W"], (int,float)) else r["Precio €/W"]
+        transporte = fmt_eur(r["Transporte"], 2) if isinstance(r["Transporte"], (int,float)) else r["Transporte"]
+        tr.append(
+            "<tr>"
+            f"<td>{r['Fecha reserva']}</td>"
+            f"<td>{r['Material']}</td>"
+            f"<td style='text-align:right'>{r['Potencia (W)']}</td>"
+            f"<td style='text-align:right'>{r['Cantidad uds']}</td>"
+            f"<td style='text-align:right'>{r['Nº Pallets']}</td>"
+            f"<td>{r['Cliente']}</td>"
+            f"<td style='text-align:right'>{precio_w}</td>"
+            f"<td style='text-align:right'>{transporte}</td>"
+            "</tr>"
+        )
+    body = (
+        "<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse'>"
+        "<thead><tr>"
+        + "".join(f"<th>{h}</th>" for h in headers) +
+        "</tr></thead>"
+        f"<tbody>{''.join(tr) if tr else '<tr><td colspan=8>Sin líneas</td></tr>'}</tbody>"
+        "</table>"
+    )
+
+    return (
+        "<div style='font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif'>"
+        + head + body + "</div>"
+    )
+
+def send_email(subject, html):
+    missing = [k for k,v in {
+        "MAIL_FROM":MAIL_FROM, "MAIL_TO":MAIL_TO, "SMTP_HOST":SMTP_HOST,
+        "SMTP_PORT":SMTP_PORT, "SMTP_USER":SMTP_USER, "SMTP_PASS":SMTP_PASS
+    }.items() if not v]
+    if missing:
+        raise SystemExit(f"Faltan variables SMTP en entorno: {', '.join(missing)}")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = MAIL_FROM
+    msg["To"] = MAIL_TO
+    msg.attach(MIMEText(html, "html"))
+
+    recipients = [e.strip() for e in (MAIL_TO or "").split(",") if e.strip()]
+
+    try:
+        if SMTP_PORT == 465:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=60) as server:
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(MAIL_FROM, recipients, msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(MAIL_FROM, recipients, msg.as_string())
+    except smtplib.SMTPAuthenticationError as e:
+        raise SystemExit(
+            "Autenticación SMTP fallida (535). En Gmail usa una CONTRASEÑA DE APLICACIÓN "
+            "y verifica que MAIL_FROM = SMTP_USER."
+        ) from e
+
 # ----------------------------- Main -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Mapeador de Sales Orders (Holded) → tabla de reserva")
+    ap = argparse.ArgumentParser(description="Mapeador de Sales Orders (Holded) → tabla de reserva (+ email opcional)")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--doc-id", help="ID de documento (salesorder) a descargar")
     g.add_argument("--minutes", type=int, help="Buscar pedidos creados en los últimos X minutos")
     ap.add_argument("--limit", type=int, default=10, help="Máximo de documentos a listar (cuando se usa --minutes)")
     ap.add_argument("--dump-json", help="Ruta base para volcar el JSON crudo de cada documento (añade sufijo con el id)")
+    ap.add_argument("--send-email", action="store_true", help="Enviar email con la tabla para cada documento procesado")
     args = ap.parse_args()
 
     if args.doc_id:
@@ -408,6 +503,12 @@ def main():
 
         rows = [build_row(doc, ln) for ln in material_lines]
         print_table(rows)
+
+        if args.send_email:
+            html = build_html_table(doc, rows)
+            subject = f"Reserva de material — Pedido {number}"
+            send_email(subject, html)
+            print("Email enviado.")
 
 if __name__ == "__main__":
     try:
