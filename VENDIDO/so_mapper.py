@@ -38,11 +38,10 @@ except Exception:
     TZ_MADRID = None  # si no hay tzdata, imprimimos en local/UTC
 
 # Preferencias de pack
-POSSIBLE_PACK_SIZES = [36, 37, 35, 33, 31, 30]  # añadido 33; ligera preferencia por 36
+POSSIBLE_PACK_SIZES = [36, 37, 35, 33, 31, 30]
 PACK_RULES = [
     (r"AIKO.*MAH72M", 36),
     (r"AIKO.*\b605\b", 36),
-    # Añade aquí tus reglas (marca/modelo) según necesites
 ]
 
 # ----------------------------- Helpers HTTP / tiempo -----------------------------
@@ -132,7 +131,6 @@ def dig(d, *keys, default=None):
     return cur
 
 def try_fields(container, candidates, default=None):
-    """Primera coincidencia en dict plano, attributes, customFields (array o dict)."""
     if not isinstance(container, dict):
         return default
     for key in candidates:
@@ -159,12 +157,6 @@ def try_fields(container, candidates, default=None):
     return default
 
 def extract_power_w(product, *, item_name="", item_sku=""):
-    """
-    Potencia (W) en este orden:
-    1) Producto (attributes/customFields): power_w, Potencia, etc.
-    2) Textos con 'W': 605W, 605 W, 605Wp...
-    3) Números 3–4 cifras sueltos (p.ej., 'A605'), filtrados 300..1000 W.
-    """
     val = try_fields(product, ["power_w", "Potencia", "potencia_w", "power", "watt", "W"])
     if val not in (None, "", []):
         try:
@@ -305,6 +297,8 @@ def build_row(doc, line):
     power_w = extract_power_w(product, item_name=item_name, item_sku=line.get("sku",""))
 
     # Pallets: SOLO si hay potencia (p.ej., paneles). Si no, "-"
+    pallets_display = "-"
+    pallets_num = 0
     if power_w:
         upp, _, _, leftover = infer_units_per_pallet(
             product, name=item_name, sku=line.get("sku",""), qty=int(qty)
@@ -314,8 +308,7 @@ def build_row(doc, line):
             f"{int(pallets)} (+{leftover})" if (isinstance(pallets, (int,float)) and leftover)
             else (str(int(pallets)) if pallets != "-" else "-")
         )
-    else:
-        pallets_display = "-"
+        pallets_num = int(pallets) if isinstance(pallets, (int,float)) else 0
 
     # Precio dinámico
     if power_w:
@@ -333,19 +326,18 @@ def build_row(doc, line):
         "Potencia (W)": int(power_w) if power_w else "-",
         "Cantidad uds": int(qty),
         "Nº Pallets": pallets_display,
+        "PalletsNum": pallets_num,     # <--- para asunto
         "Cliente": (cliente_name or "-"),
-        "PrecioValor": precio_valor,   # número
-        "PrecioUnidad": precio_unidad, # "€/W" o "€/ud"
-        "PrecioDecs": decs,            # 4 si €/W, 2 si €/ud
-        "Transporte": "-"              # se rellenará solo en la PRIMERA fila
+        "PrecioValor": precio_valor,
+        "PrecioUnidad": precio_unidad,
+        "PrecioDecs": decs,
+        "Transporte": "-"              # se rellena luego solo en primera fila
     }
 
 def _display_rows_for_console(rows):
-    """Prepara filas de texto ya formateadas para impresión en consola."""
     disp = []
     for r in rows:
-        precio_txt = fmt_eur(r["PrecioValor"], r["PrecioDecs"])
-        precio_txt = precio_txt.replace(" €", f" {r['PrecioUnidad']}")
+        precio_txt = fmt_eur(r["PrecioValor"], r["PrecioDecs"]).replace(" €", f" {r['PrecioUnidad']}")
         if isinstance(r["Transporte"], (int,float)):
             transp_txt = fmt_eur(r["Transporte"], 2)
         else:
@@ -382,6 +374,23 @@ def dump_json(obj, path):
     print(f"[dump] JSON guardado en: {path}")
 
 # ----------------------------- Email -----------------------------
+def build_email_subject(doc, rows):
+    """VENDIDO {nºpallets} pallet {material vendido} a {Cliente}"""
+    cliente = doc.get("contactName") or "-"
+    # pallets totales (solo líneas con pallets calculados)
+    pallets_total = sum(int(r.get("PalletsNum") or 0) for r in rows)
+    # material vendido: único o "xxx (+N más)"
+    materials = [r.get("Material") or "-" for r in rows]
+    distinct = []
+    for m in materials:
+        if m not in distinct:
+            distinct.append(m)
+    if len(distinct) <= 1:
+        material_label = distinct[0] if distinct else "-"
+    else:
+        material_label = f"{distinct[0]} (+{len(distinct)-1} más)"
+    return f"VENDIDO {pallets_total} pallet {material_label} a {cliente}"
+
 def build_html_table(doc, rows):
     number = doc.get("number") or doc.get("code") or doc.get("docNumber") or (doc.get("_id") or doc.get("id") or "-")
     cliente = doc.get("contactName") or "-"
@@ -506,7 +515,7 @@ def main():
 
         if args.send_email:
             html = build_html_table(doc, rows)
-            subject = f"Reserva de material — Pedido {number}"
+            subject = build_email_subject(doc, rows)   # <-- asunto personalizado
             send_email(subject, html)
             print("Email enviado.")
 
