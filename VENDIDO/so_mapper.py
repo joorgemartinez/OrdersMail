@@ -145,6 +145,25 @@ def save_processed_ids(path, ids_set):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(sorted(ids_set), ensure_ascii=False, indent=2), encoding="utf-8")
 
+# ----------------------------- Detectar Transporte por NOMBRE -----------------------------
+TRANSPORT_NAME_PATTERNS = [
+    r"^\s*transporte\s*$",
+    r"^\s*shipping\s*costs?\s*$",
+    r"^\s*shipping\s*$",
+    r"^\s*shipment\s*$",
+    r"^\s*transport\s*$",
+    r"^\s*flete\s*$",
+    r"^\s*portes?\s*$",
+    r"^\s*env[ií]o\s*$",
+]
+
+def is_transport_name(name: str) -> bool:
+    n = (name or "").strip().lower()
+    for pat in TRANSPORT_NAME_PATTERNS:
+        if re.match(pat, n):
+            return True
+    return False
+
 # ----------------------------- Extractores robustos -----------------------------
 def dig(d, *keys, default=None):
     cur = d
@@ -230,9 +249,8 @@ def extract_transport_amount_from_doc(doc):
     total = 0.0
     found = False
     for p in (doc.get("products") or []):
-        name = (p.get("name") or "").strip().lower()
-        tags = [t.lower() for t in (p.get("tags") or [])]
-        if "transporte" in name or "transporte" in tags:
+        name = (p.get("name") or "")
+        if is_transport_name(name):
             price = float(p.get("price") or 0)
             units = float(p.get("units") or 0)
             total += price * units
@@ -241,9 +259,7 @@ def extract_transport_amount_from_doc(doc):
 
 def has_transport_line(doc):
     for p in (doc.get("products") or []):
-        name = (p.get("name") or "").strip().lower()
-        tags = [t.lower() for t in (p.get("tags") or [])]
-        if "transporte" in name or "transporte" in tags:
+        if is_transport_name(p.get("name") or ""):
             return True
     return False
 
@@ -257,7 +273,7 @@ def to_date_label(doc):
 def iter_document_lines(doc):
     for it in (doc.get("products") or []):
         name = (it.get("name") or "").strip()
-        is_transport = name.lower() == "transporte" or "transporte" in [t.lower() for t in (it.get("tags") or [])]
+        is_transport = is_transport_name(name)  # <-- SOLO por nombre
         yield {
             "name": name,
             "desc": it.get("desc"),
@@ -399,14 +415,10 @@ def dump_json(obj, path):
 
 # ----------------------------- Email -----------------------------
 def build_email_subject(doc, rows):
-    """Asunto:
-       - Con pallets:  VENDIDO {n_pallets} pallets {material} a {Cliente}
-       - Sin pallets:  VENDIDO {n_unidades} uds {material} a {Cliente}
-       Robusto si no hay líneas.
-    """
+    """Con pallets: VENDIDO {n_pallets} pallets {material} a {Cliente}
+       Sin pallets: VENDIDO {n_unidades} uds {material} a {Cliente}."""
     cliente = doc.get("contactName") or "-"
 
-    # Material (mismo criterio que ya tenías)
     if rows:
         materials = [r.get("Material") or "-" for r in rows]
         distinct = []
@@ -417,20 +429,17 @@ def build_email_subject(doc, rows):
     else:
         material_label = "Transporte" if has_transport_line(doc) else "Sin líneas"
 
-    # ¿Hay pallets?
     pallets_total = sum(int(r.get("PalletsNum") or 0) for r in rows) if rows else 0
 
     if pallets_total > 0:
         qty = pallets_total
         unit_word = "pallets" if qty != 1 else "pallet"
     else:
-        # Sin pallets → usamos unidades totales
         units_total = sum(int(r.get("Cantidad uds") or 0) for r in rows) if rows else 0
         qty = units_total
         unit_word = "uds" if qty != 1 else "ud"
 
     return f"VENDIDO {qty} {unit_word} {material_label} a {cliente}"
-
 
 def build_html_table(doc, rows):
     number = doc.get("number") or doc.get("code") or doc.get("docNumber") or (doc.get("_id") or doc.get("id") or "-")
