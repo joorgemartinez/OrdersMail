@@ -30,12 +30,12 @@ BASE_DOCS   = "https://api.holded.com/api/invoicing/v1/documents"
 BASE_PROD   = "https://api.holded.com/api/invoicing/v1/products"
 PAGE_LIMIT  = 200
 
-# Zona horaria para impresión
+# Zona horaria para impresión / cómputo de días
 try:
     from zoneinfo import ZoneInfo
     TZ_MADRID = ZoneInfo("Europe/Madrid")
 except Exception:
-    TZ_MADRID = None  # si no hay tzdata, imprimimos en local/UTC
+    TZ_MADRID = timezone.utc  # fallback
 
 # Preferencias de pack
 POSSIBLE_PACK_SIZES = [36, 37, 35, 33, 31, 30]
@@ -60,13 +60,23 @@ def to_madrid_str_from_epoch(s):
         ts = int(s)
     except Exception:
         return str(s)
-    tz = TZ_MADRID or timezone.utc
-    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(TZ_MADRID).strftime("%Y-%m-%d %H:%M:%S")
 
-def utc_bounds_last_minutes(minutes=10, tz=TZ_MADRID):
-    now_tz = datetime.now(tz or timezone.utc)
+def utc_bounds_last_minutes(minutes=10):
+    now_tz = datetime.now(TZ_MADRID)
     start = now_tz - timedelta(minutes=minutes)
     return int(start.astimezone(timezone.utc).timestamp()), int(now_tz.astimezone(timezone.utc).timestamp())
+
+def madrid_day_bounds_epoch_seconds(day_offset=0):
+    """
+    (start_utc, end_utc) para el día 'hoy + day_offset' en Europe/Madrid.
+    day_offset=0 -> hoy; -1 -> ayer; +1 -> mañana.
+    """
+    now_mad = datetime.now(TZ_MADRID)
+    target = (now_mad + timedelta(days=day_offset)).date()
+    start_mad = datetime(target.year, target.month, target.day, 0, 0, 0, tzinfo=TZ_MADRID)
+    end_mad   = datetime(target.year, target.month, target.day, 23, 59, 59, tzinfo=TZ_MADRID)
+    return int(start_mad.astimezone(timezone.utc).timestamp()), int(end_mad.astimezone(timezone.utc).timestamp())
 
 def fmt_eur(n, decimals=4):
     try:
@@ -91,7 +101,8 @@ def list_salesorders_between(start_epoch_utc, end_epoch_utc, page_limit=PAGE_LIM
     page = 1
     out = []
     while True:
-        params = {"page": page, "limit": page_limit, "starttmp": str(start_epoch_utc), "endtmp": str(end_epoch_utc)}
+        params = {"page": page, "limit": page_limit,
+                  "starttmp": str(start_epoch_utc), "endtmp": str(end_epoch_utc)}
         r = requests.get(url, headers=H(), params=params, timeout=60)
         if r.status_code == 401:
             raise SystemExit(f"401 Unauthorized: {r.text}")
@@ -117,6 +128,22 @@ def get_product(product_id):
     data = r.json()
     _prod_cache[product_id] = data
     return data
+
+# ----------------------------- Helpers de estado -----------------------------
+def load_processed_ids(path):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return set()
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return set(data if isinstance(data, list) else [])
+    except Exception:
+        return set()
+
+def save_processed_ids(path, ids_set):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(sorted(ids_set), ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ----------------------------- Extractores robustos -----------------------------
 def dig(d, *keys, default=None):
@@ -163,7 +190,6 @@ def extract_power_w(product, *, item_name="", item_sku=""):
             return float(val)
         except Exception:
             pass
-
     texts = [
         item_name or "",
         item_sku or "",
@@ -175,7 +201,6 @@ def extract_power_w(product, *, item_name="", item_sku=""):
         cands = [int(x) for x in m if 300 <= int(x) <= 1000]
         if cands:
             return float(max(cands))
-
     generic = []
     for txt in texts:
         for x in re.findall(r"(?<!\d)(\d{3,4})(?!\d)", txt):
@@ -213,6 +238,14 @@ def extract_transport_amount_from_doc(doc):
             total += price * units
             found = True
     return total if found else "-"
+
+def has_transport_line(doc):
+    for p in (doc.get("products") or []):
+        name = (p.get("name") or "").strip().lower()
+        tags = [t.lower() for t in (p.get("tags") or [])]
+        if "transporte" in name or "transporte" in tags:
+            return True
+    return False
 
 def to_date_label(doc):
     v = doc.get("date") or doc.get("createdAt") or doc.get("issuedOn") or doc.get("updatedAt")
@@ -252,12 +285,10 @@ def infer_units_per_pallet(product, *, name="", sku="", qty=0):
     if (upp := extract_units_per_pallet(product)) > 0:
         leftover = qty % upp if qty and upp else 0
         return upp, "attr", [], int(leftover)
-
     upp = hint_units_per_pallet_by_pattern(name=name, sku=sku, product=product)
     if upp > 0:
         leftover = qty % upp if qty and upp else 0
         return upp, "pattern", [], int(leftover)
-
     if qty:
         exact = [p for p in POSSIBLE_PACK_SIZES if qty % p == 0]
         if len(exact) == 1:
@@ -266,7 +297,6 @@ def infer_units_per_pallet(product, *, name="", sku="", qty=0):
             preferred = 36 if 36 in exact else max(exact)
             others = [p for p in exact if p != preferred]
             return float(preferred), "ambiguous_divisible", others, 0
-
         best_p = None
         best_leftover = None
         for p in POSSIBLE_PACK_SIZES:
@@ -276,12 +306,11 @@ def infer_units_per_pallet(product, *, name="", sku="", qty=0):
                 best_leftover = rem
                 best_p = p
         return float(best_p), "closest", [], int(best_leftover or 0)
-
     return 0.0, "unknown", [], 0
 
 # ----------------------------- Render/Debug -----------------------------
 def build_row(doc, line):
-    """Crea la fila con precio €/W SI hay potencia; si no, precio unitario €/ud. Pallets solo si hay potencia."""
+    """€/W si hay potencia; si no, €/ud. Pallets solo si hay potencia."""
     cliente_name = doc.get("contactName") or "-"
     item_name = line["name"] or "-"
     qty = float(line["qty"] or 0)
@@ -296,7 +325,6 @@ def build_row(doc, line):
 
     power_w = extract_power_w(product, item_name=item_name, item_sku=line.get("sku",""))
 
-    # Pallets: SOLO si hay potencia (p.ej., paneles). Si no, "-"
     pallets_display = "-"
     pallets_num = 0
     if power_w:
@@ -310,7 +338,6 @@ def build_row(doc, line):
         )
         pallets_num = int(pallets) if isinstance(pallets, (int,float)) else 0
 
-    # Precio dinámico
     if power_w:
         precio_valor = compute_price_per_w(amount, qty, power_w)   # €/W
         precio_unidad = "€/W"
@@ -326,22 +353,19 @@ def build_row(doc, line):
         "Potencia (W)": int(power_w) if power_w else "-",
         "Cantidad uds": int(qty),
         "Nº Pallets": pallets_display,
-        "PalletsNum": pallets_num,     # <--- para asunto
+        "PalletsNum": pallets_num,
         "Cliente": (cliente_name or "-"),
         "PrecioValor": precio_valor,
         "PrecioUnidad": precio_unidad,
         "PrecioDecs": decs,
-        "Transporte": "-"              # se rellena luego solo en primera fila
+        "Transporte": "-"  # se rellena luego solo en primera fila
     }
 
 def _display_rows_for_console(rows):
     disp = []
     for r in rows:
         precio_txt = fmt_eur(r["PrecioValor"], r["PrecioDecs"]).replace(" €", f" {r['PrecioUnidad']}")
-        if isinstance(r["Transporte"], (int,float)):
-            transp_txt = fmt_eur(r["Transporte"], 2)
-        else:
-            transp_txt = str(r["Transporte"])
+        transp_txt = fmt_eur(r["Transporte"], 2) if isinstance(r["Transporte"], (int,float)) else str(r["Transporte"])
         disp.append({
             "Fecha reserva": str(r["Fecha reserva"]),
             "Material": str(r["Material"]),
@@ -375,21 +399,21 @@ def dump_json(obj, path):
 
 # ----------------------------- Email -----------------------------
 def build_email_subject(doc, rows):
-    """VENDIDO {nºpallets} pallet {material vendido} a {Cliente}"""
+    """VENDIDO {nºpallets} {material vendido} a {Cliente} — robusto si no hay líneas."""
     cliente = doc.get("contactName") or "-"
-    # pallets totales (solo líneas con pallets calculados)
-    pallets_total = sum(int(r.get("PalletsNum") or 0) for r in rows)
-    # material vendido: único o "xxx (+N más)"
-    materials = [r.get("Material") or "-" for r in rows]
-    distinct = []
-    for m in materials:
-        if m not in distinct:
-            distinct.append(m)
-    if len(distinct) <= 1:
-        material_label = distinct[0] if distinct else "-"
+    pallets_total = sum(int(r.get("PalletsNum") or 0) for r in rows) if rows else 0
+
+    if rows:
+        materials = [r.get("Material") or "-" for r in rows]
+        distinct = []
+        for m in materials:
+            if m not in distinct:
+                distinct.append(m)
+        material_label = distinct[0] if len(distinct) <= 1 else f"{distinct[0]} (+{len(distinct)-1} más)"
     else:
-        material_label = f"{distinct[0]} (+{len(distinct)-1} más)"
-    return f"VENDIDO {pallets_total} pallet {material_label} a {cliente}"
+        material_label = "Transporte" if has_transport_line(doc) else "Sin líneas"
+
+    return f"VENDIDO {pallets_total} {material_label} a {cliente}"
 
 def build_html_table(doc, rows):
     number = doc.get("number") or doc.get("code") or doc.get("docNumber") or (doc.get("_id") or doc.get("id") or "-")
@@ -468,33 +492,60 @@ def send_email(subject, html):
 
 # ----------------------------- Main -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Mapeador de Sales Orders (Holded) → reserva (+ email opcional)")
+    ap = argparse.ArgumentParser(description="Poller de Sales Orders (Holded) → reserva (+ email opcional)")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--doc-id", help="ID de documento (salesorder) a descargar")
     g.add_argument("--minutes", type=int, help="Buscar pedidos creados en los últimos X minutos")
-    ap.add_argument("--limit", type=int, default=10, help="Máximo de documentos a listar (cuando se usa --minutes)")
+    g.add_argument("--days", type=int, help="Buscar pedidos de los últimos N días incluyendo hoy (1 = hoy+yesterday)")
+    ap.add_argument("--limit", type=int, default=200, help="Máximo de documentos a procesar")
     ap.add_argument("--dump-json", help="Ruta base para volcar el JSON crudo de cada documento (añade sufijo con el id)")
     ap.add_argument("--send-email", action="store_true", help="Enviar email con la tabla para cada documento procesado")
+    ap.add_argument("--state-file", default=".state/processed_salesorders.json",
+                    help="Ruta al JSON de IDs ya procesados (para evitar duplicados)")
     args = ap.parse_args()
 
+    # Obtener docs según el modo
     if args.doc_id:
-        doc = get_salesorder(args.doc_id)
-        docs = [doc]
-    else:
+        docs = [get_salesorder(args.doc_id)]
+    elif args.minutes:
         start, end = utc_bounds_last_minutes(args.minutes)
         docs = list_salesorders_between(start, end)
-        try:
-            docs.sort(key=lambda d: int(d.get("date") or 0), reverse=True)
-        except Exception:
-            pass
-        docs = docs[:args.limit]
+    else:  # args.days
+        days = max(0, int(args.days or 0))
+        docs = []
+        for d in range(0, -(days) - 1, -1):  # 0, -1, -2, ...
+            s, e = madrid_day_bounds_epoch_seconds(day_offset=d)
+            docs.extend(list_salesorders_between(s, e))
+
+    # Deduplicar por ID y ordenar por fecha (si hay)
+    def _doc_id(d):
+        return d.get("_id") or d.get("id") or d.get("docNumber") or d.get("number") or ""
+    uniq = {}
+    for d in docs:
+        did = _doc_id(d)
+        if did and did not in uniq:
+            uniq[did] = d
+    docs = list(uniq.values())
+    try:
+        docs.sort(key=lambda d: int(d.get("date") or 0), reverse=True)
+    except Exception:
+        pass
+    docs = docs[:args.limit]
 
     if not docs:
-        print("No se han encontrado documentos.")
+        print("No se han encontrado documentos en la ventana solicitada.")
         return
 
-    for doc in docs:
-        doc_id = doc.get("_id") or doc.get("id") or "-"
+    # Cargar estado y filtrar nuevos
+    processed = load_processed_ids(args.state_file)
+    docs_new = [d for d in docs if _doc_id(d) and _doc_id(d) not in processed]
+
+    if not docs_new and not args.doc_id:
+        print("No hay documentos NUEVOS para procesar.")
+        return
+
+    for doc in (docs_new if not args.doc_id else docs):
+        doc_id = _doc_id(doc)
         number = doc.get("number") or doc.get("code") or doc.get("docNumber") or doc_id
         print(f"\n=== Sales Order: {number} (id: {doc_id}) ===")
 
@@ -515,9 +566,19 @@ def main():
 
         if args.send_email:
             html = build_html_table(doc, rows)
-            subject = build_email_subject(doc, rows)   # <-- asunto personalizado
+            subject = build_email_subject(doc, rows)
             send_email(subject, html)
             print("Email enviado.")
+
+        # Marcar como procesado y GUARDAR INCREMENTALMENTE (salvo --doc-id)
+        if not args.doc_id:
+            processed.add(doc_id)
+            save_processed_ids(args.state_file, processed)
+
+    # Guardado final (por si acaso)
+    if not args.doc_id:
+        save_processed_ids(args.state_file, processed)
+        print(f"[estado] Guardados {len(processed)} IDs en {args.state_file}")
 
 if __name__ == "__main__":
     try:
