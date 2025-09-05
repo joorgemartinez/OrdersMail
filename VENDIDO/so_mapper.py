@@ -399,10 +399,14 @@ def dump_json(obj, path):
 
 # ----------------------------- Email -----------------------------
 def build_email_subject(doc, rows):
-    """VENDIDO {nºpallets} {material vendido} a {Cliente} — robusto si no hay líneas."""
+    """Asunto:
+       - Con pallets:  VENDIDO {n_pallets} pallets {material} a {Cliente}
+       - Sin pallets:  VENDIDO {n_unidades} uds {material} a {Cliente}
+       Robusto si no hay líneas.
+    """
     cliente = doc.get("contactName") or "-"
-    pallets_total = sum(int(r.get("PalletsNum") or 0) for r in rows) if rows else 0
 
+    # Material (mismo criterio que ya tenías)
     if rows:
         materials = [r.get("Material") or "-" for r in rows]
         distinct = []
@@ -413,7 +417,20 @@ def build_email_subject(doc, rows):
     else:
         material_label = "Transporte" if has_transport_line(doc) else "Sin líneas"
 
-    return f"VENDIDO {pallets_total} {material_label} a {cliente}"
+    # ¿Hay pallets?
+    pallets_total = sum(int(r.get("PalletsNum") or 0) for r in rows) if rows else 0
+
+    if pallets_total > 0:
+        qty = pallets_total
+        unit_word = "pallets" if qty != 1 else "pallet"
+    else:
+        # Sin pallets → usamos unidades totales
+        units_total = sum(int(r.get("Cantidad uds") or 0) for r in rows) if rows else 0
+        qty = units_total
+        unit_word = "uds" if qty != 1 else "ud"
+
+    return f"VENDIDO {qty} {unit_word} {material_label} a {cliente}"
+
 
 def build_html_table(doc, rows):
     number = doc.get("number") or doc.get("code") or doc.get("docNumber") or (doc.get("_id") or doc.get("id") or "-")
