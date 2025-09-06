@@ -1,2 +1,0 @@
-python so_mapper.py --doc-id "" --send-email
-68b02a9d32f8e0f605021507
