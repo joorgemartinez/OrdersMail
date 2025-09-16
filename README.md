@@ -115,3 +115,39 @@ Pedidos de AYER (5) — 14/09/2025 — Total 12.345,67 €
 - La hora de corte es **00:00–23:59 Madrid**, gracias a `zoneinfo`.
 - El script tolera distintas claves de pedido: `number`, `code` o `serial`.
 - En Gmail, recuerda usar una **Contraseña de aplicación** y asegurarte de que `MAIL_FROM = SMTP_USER`.
+
+---
+
+## ⏸️ Desactivar el workflow
+
+Si no quieres que GitHub Actions lo ejecute automáticamente (por ejemplo, mientras haces pruebas o si no has configurado las variables de entorno), tienes varias opciones:
+
+1. **Deshabilitarlo desde GitHub**  
+   - Entra en la pestaña **Actions** → selecciona el workflow → botón **…** → **Disable workflow**.
+
+2. **Editar el trigger en el YAML**  
+   - Comenta o elimina la parte `schedule:` para que no se lance cada día.  
+   - Ejemplo:
+     ```yaml
+     on:
+       # schedule:
+       #   - cron: "0 6 * * *"
+       workflow_dispatch:
+     ```
+     De esta forma solo podrá ejecutarse manualmente.
+
+3. **Bloquear el job**  
+   - Añade un guardado en el YAML para que nunca corra:
+     ```yaml
+     jobs:
+       run-script:
+         if: ${{ false }}
+         runs-on: ubuntu-latest
+         steps:
+           - run: echo "Workflow deshabilitado"
+     ```
+
+4. **Renombrar/mover el archivo**  
+   - Si renombrás el archivo a algo distinto de `.yml` o lo mueves fuera de `.github/workflows/`, GitHub Actions lo ignorará.
+
+Así evitas errores por variables de entorno faltantes hasta que quieras volver a habilitarlo.
