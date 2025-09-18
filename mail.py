@@ -6,8 +6,6 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 # Carga .env si existe (útil en local). En GitHub Actions leerá de os.environ (secrets).
 try:
@@ -27,14 +25,15 @@ SMTP_PORT   = int(os.getenv("SMTP_PORT", "587"))  # 587 STARTTLS | 465 SSL
 SMTP_USER   = os.getenv("SMTP_USER")
 SMTP_PASS   = os.getenv("SMTP_PASS")
 
-BASE_URL   = "https://api.holded.com/api/invoicing/v1/documents/salesorder"
+BASE_URL_ORDERS   = "https://api.holded.com/api/invoicing/v1/documents/salesorder"
+BASE_URL_INVOICES = "https://api.holded.com/api/invoicing/v1/documents/invoice"
 PAGE_LIMIT = 200
 
-# Zona horaria Madrid (necesita tzdata instalado en el entorno)
+# Zona horaria Madrid
 from zoneinfo import ZoneInfo
 TZ_MADRID = ZoneInfo("Europe/Madrid")
 
-# --- Helpers generales ---
+# --- Helpers ---
 def headers():
     if not API_KEY:
         raise SystemExit("ERROR: falta HOLDED_API_KEY en variables de entorno")
@@ -53,9 +52,6 @@ def fmt_eur(n):
     return f"{v:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def madrid_yesterday_bounds_epoch_seconds():
-    """
-    00:00–23:59:59 de AYER en Europe/Madrid -> epoch segundos (UTC).
-    """
     now_mad = datetime.now(TZ_MADRID)
     ayer = now_mad - timedelta(days=1)
     start_mad = datetime(ayer.year, ayer.month, ayer.day, 0, 0, 0, tzinfo=TZ_MADRID)
@@ -89,36 +85,36 @@ def doc_number(d: dict) -> str:
     )
 
 # --- API ---
-def fetch_yesterday_orders():
+def fetch_yesterday(base_url):
     start_s, end_s = madrid_yesterday_bounds_epoch_seconds()
-    orders = []
+    items = []
     page = 1
     while True:
         params = {"page": page, "limit": PAGE_LIMIT,
                   "starttmp": str(start_s), "endtmp": str(end_s)}
-        r = requests.get(BASE_URL, headers=headers(), params=params, timeout=60)
+        r = requests.get(base_url, headers=headers(), params=params, timeout=60)
         if r.status_code == 401:
             raise SystemExit(f"401 Unauthorized: {r.text}")
         r.raise_for_status()
         batch = r.json()
         if not batch:
             break
-        orders.extend(batch)
+        items.extend(batch)
         if len(batch) < PAGE_LIMIT:
             break
         page += 1
-    return orders
+    return items
 
 # --- HTML ---
-def build_html_table(orders, date_label, total_day):
-    if not orders:
-        return f"<p>No hay pedidos AYER ({date_label}).</p>"
+def build_html_table(items, date_label, total_day, titulo, subtitulo):
+    if not items:
+        return f"<p>No hay {titulo.lower()} AYER ({date_label}).</p>"
 
     rows = []
-    for d in orders:
+    for d in items:
         number   = doc_number(d)
         customer = (d.get("customer") or {}).get("name") or d.get("contactName") or "-"
-        total    = float(d.get("total", 0) or 0)  # euros
+        total    = float(d.get("total", 0) or 0)
         fecha    = d.get("date") or d.get("createdAt") or d.get("issuedOn") or d.get("updatedAt") or "-"
         fecha_hr = epoch_to_local_str(fecha) if str(fecha).isdigit() else fecha
         rows.append(
@@ -133,8 +129,8 @@ def build_html_table(orders, date_label, total_day):
     rows_html = "\n".join(rows)
     return f"""
     <div style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif">
-      <h3 style="margin:0 0 8px">Pedidos de AYER — {date_label}</h3>
-      <p style="margin:0 0 12px">Total pedidos: <b>{len(orders)}</b> &nbsp;|&nbsp; Importe total: <b>{fmt_eur(total_day)}</b></p>
+      <h3 style="margin:0 0 8px">{titulo} de AYER — {date_label}</h3>
+      <p style="margin:0 0 12px">Total {subtitulo}: <b>{len(items)}</b> &nbsp;|&nbsp; Importe total: <b>{fmt_eur(total_day)}</b></p>
       <table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse">
         <thead><tr><th>Nº</th><th>Cliente</th><th>Total</th><th>Fecha</th></tr></thead>
         <tbody>{rows_html}</tbody>
@@ -178,23 +174,11 @@ def send_email(subject, html):
             "y verifica que MAIL_FROM = SMTP_USER."
         ) from e
 
-# --- Main ---
-def main():
-    date_label = madrid_yesterday_label()
-    orders = fetch_yesterday_orders()
-
-    print(f"Pedidos de AYER ({date_label}): {len(orders)}\n")
-    if not orders:
-        print("No hubo pedidos ayer.")
-        # Si NO quieres email cuando no haya pedidos, comenta estas 3 líneas:
-        html = build_html_table(orders, date_label, 0.0)
-        subject = f"Pedidos de AYER (0) — {date_label}"
-        send_email(subject, html)
-        print("Email enviado (0 pedidos).")
-        return
-
+# --- Print helper ---
+def print_section(items, date_label, titulo):
+    print(f"{titulo} de AYER ({date_label}): {len(items)}\n")
     total_day = 0.0
-    for d in orders:
+    for d in items:
         number   = doc_number(d)
         customer = (d.get("customer") or {}).get("name") or d.get("contactName") or "-"
         total    = float(d.get("total", 0) or 0)
@@ -202,14 +186,29 @@ def main():
         fecha_hr = epoch_to_local_str(fecha) if str(fecha).isdigit() else fecha
         total_day += total
         print(f"{number:>12} | {customer} | {fmt_eur(total):>12} | {fecha_hr}")
-
     print("\n" + "-"*60)
     print(f"TOTAL del día (AYER): {fmt_eur(total_day)}")
     print("-"*60)
+    return total_day
 
-    html = build_html_table(orders, date_label, total_day)
-    subject = f"Pedidos de AYER ({len(orders)}) — {date_label} — Total {fmt_eur(total_day)}"
+# --- Main ---
+def main():
+    date_label = madrid_yesterday_label()
+
+    orders   = fetch_yesterday(BASE_URL_ORDERS)
+    invoices = fetch_yesterday(BASE_URL_INVOICES)
+
+    total_orders   = print_section(orders, date_label, "Pedidos")
+    total_invoices = print_section(invoices, date_label, "Facturas")
+
+    # Email
+    html_orders   = build_html_table(orders, date_label, total_orders, "Pedidos", "pedidos")
+    html_invoices = build_html_table(invoices, date_label, total_invoices, "Facturas", "facturas")
+
+    html = html_orders + "<br><br>" + html_invoices
+    subject = f"Pedidos ({len(orders)}) y Facturas ({len(invoices)}) — {date_label}"
     send_email(subject, html)
+
     print("Email enviado.")
 
 if __name__ == "__main__":
