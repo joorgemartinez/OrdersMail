@@ -9,7 +9,6 @@ from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-
 # Carga .env si existe (útil en local). En GitHub Actions leerá de os.environ (secrets).
 try:
     from dotenv import load_dotenv
@@ -35,7 +34,7 @@ PAGE_LIMIT = 200
 from zoneinfo import ZoneInfo
 TZ_MADRID = ZoneInfo("Europe/Madrid")
 
-# --- Helpers API ---
+# --- Helpers generales ---
 def headers():
     if not API_KEY:
         raise SystemExit("ERROR: falta HOLDED_API_KEY en variables de entorno")
@@ -68,6 +67,28 @@ def madrid_yesterday_bounds_epoch_seconds():
 def madrid_yesterday_label():
     return (datetime.now(TZ_MADRID) - timedelta(days=1)).strftime("%d/%m/%Y")
 
+def epoch_to_local_str(s):
+    try:
+        return datetime.fromtimestamp(int(s), tz=timezone.utc).astimezone(TZ_MADRID).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(s)
+
+def doc_number(d: dict) -> str:
+    """
+    Devuelve un identificador humano del documento priorizando:
+    number → docNumber → code → serial → _id → id → '-'
+    """
+    return (
+        d.get("number")
+        or d.get("docNumber")
+        or d.get("code")
+        or d.get("serial")
+        or d.get("_id")
+        or d.get("id")
+        or "-"
+    )
+
+# --- API ---
 def fetch_yesterday_orders():
     start_s, end_s = madrid_yesterday_bounds_epoch_seconds()
     orders = []
@@ -88,12 +109,6 @@ def fetch_yesterday_orders():
         page += 1
     return orders
 
-def epoch_to_local_str(s):
-    try:
-        return datetime.fromtimestamp(int(s), tz=timezone.utc).astimezone(TZ_MADRID).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return str(s)
-
 # --- HTML ---
 def build_html_table(orders, date_label, total_day):
     if not orders:
@@ -101,7 +116,7 @@ def build_html_table(orders, date_label, total_day):
 
     rows = []
     for d in orders:
-        number   = d.get("number") or d.get("code") or d.get("serial") or "-"
+        number   = doc_number(d)
         customer = (d.get("customer") or {}).get("name") or d.get("contactName") or "-"
         total    = float(d.get("total", 0) or 0)  # euros
         fecha    = d.get("date") or d.get("createdAt") or d.get("issuedOn") or d.get("updatedAt") or "-"
@@ -180,7 +195,7 @@ def main():
 
     total_day = 0.0
     for d in orders:
-        number   = d.get("number") or d.get("code") or d.get("serial") or "-"
+        number   = doc_number(d)
         customer = (d.get("customer") or {}).get("name") or d.get("contactName") or "-"
         total    = float(d.get("total", 0) or 0)
         fecha    = d.get("date") or d.get("createdAt") or d.get("issuedOn") or d.get("updatedAt") or "-"
