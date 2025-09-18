@@ -1,22 +1,28 @@
-# 📧 Daily Holded Orders Report
+# 📧 Daily Holded Orders & Invoices Report
 
-Script en **Python** que consulta los **pedidos de venta (Sales Orders) en Holded** del día anterior (zona horaria Madrid) y envía un **reporte por email** con una tabla en HTML.  
+Script en **Python** que consulta los **Pedidos de Venta (Sales Orders) y Facturas (Invoices) en Holded** del día anterior (zona horaria Madrid) y envía un **reporte por email** con una tabla en HTML.  
 El envío puede ejecutarse **manualmente en local** o de forma **automática cada mañana con GitHub Actions**.
 
 ---
 
 ## 🚀 ¿Qué hace?
 
-- Consulta la API de **Holded** para obtener los pedidos de **ayer**.
-- Convierte los resultados en una tabla HTML con:
-  - Nº de pedido  
+- Consulta la API de **Holded** para obtener:
+  - **Pedidos** del día anterior
+  - **Facturas** del día anterior
+- Convierte los resultados en **dos tablas HTML** (una para pedidos y otra para facturas) con:
+  - Nº de pedido / factura  
   - Cliente  
   - Importe total (€)  
-  - Fecha del pedido  
+  - Fecha del documento
 - Envía un **correo electrónico** con el resumen:
-  - Asunto → `Pedidos de AYER (X) — DD/MM/YYYY — Total XXX €`
-  - Cuerpo → tabla con todos los pedidos
-- Si no hubo pedidos, también envía un email indicando **"0 pedidos"** (esto se puede desactivar comentando 3 líneas en `main()`).
+  - **Asunto**:
+    ```
+    Pedidos (X) y Facturas (Y) — DD/MM/YYYY
+    ```
+  - **Cuerpo**: dos tablas (Pedidos + Facturas)
+- Si no hubo pedidos o facturas, aparece una sección indicando **"No hay pedidos"** o **"No hay facturas"**  
+  *(esto se puede desactivar comentando líneas en `main()`)*.
 
 ---
 
@@ -98,22 +104,29 @@ Ejemplo de correo recibido:
 
 **Asunto**:
 
-Pedidos de AYER (5) — 14/09/2025 — Total 12.345,67 €
+Pedidos (5) y Facturas (3) — 14/09/2025
+
 
 **Cuerpo**:
 
+### Pedidos
 | Nº     | Cliente    | Total      | Fecha              |
 |--------|------------|------------|--------------------|
 | SO-101 | Cliente A  | 1.200,00 € | 2025-09-14 09:15:00 |
 | SO-102 | Cliente B  |   950,00 € | 2025-09-14 11:20:00 |
-| …      | …          | …          | …                  |
+
+### Facturas
+| Nº     | Cliente    | Total      | Fecha              |
+|--------|------------|------------|--------------------|
+| INV-55 | Cliente A  |  500,00 €  | 2025-09-14 12:00:00 |
+| INV-56 | Cliente C  |  750,00 €  | 2025-09-14 13:30:00 |
 
 ---
 
 ## 📝 Notas
 
 - La hora de corte es **00:00–23:59 Madrid**, gracias a `zoneinfo`.
-- El script tolera distintas claves de pedido: `number`, `code` o `serial`.
+- El script tolera distintas claves de documento: `number`, `docNumber`, `code`, `serial`.
 - En Gmail, recuerda usar una **Contraseña de aplicación** y asegurarte de que `MAIL_FROM = SMTP_USER`.
 
 ---
