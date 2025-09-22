@@ -2,15 +2,17 @@ import os
 import smtplib
 import ssl
 import requests
+import json
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-# Carga .env si existe (útil en local). En GitHub Actions leerá de os.environ (secrets).
+# --- Cargar .env ---
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).with_name(".env"))
+    load_dotenv(Path(__file__).with_name(".env"))  # Busca .env en la misma carpeta que mail.py
 except Exception:
     pass
 
@@ -29,8 +31,10 @@ BASE_URL_ORDERS   = "https://api.holded.com/api/invoicing/v1/documents/salesorde
 BASE_URL_INVOICES = "https://api.holded.com/api/invoicing/v1/documents/invoice"
 PAGE_LIMIT = 200
 
+# Archivos de estado
+STATE_FILE_INVOICES = Path(".state/processed_invoices.json")
+
 # Zona horaria Madrid
-from zoneinfo import ZoneInfo
 TZ_MADRID = ZoneInfo("Europe/Madrid")
 
 # --- Helpers ---
@@ -70,10 +74,6 @@ def epoch_to_local_str(s):
         return str(s)
 
 def doc_number(d: dict) -> str:
-    """
-    Devuelve un identificador humano del documento priorizando:
-    number → docNumber → code → serial → _id → id → '-'
-    """
     return (
         d.get("number")
         or d.get("docNumber")
@@ -83,6 +83,19 @@ def doc_number(d: dict) -> str:
         or d.get("id")
         or "-"
     )
+
+# --- Estado facturas ---
+def load_processed_invoices():
+    if STATE_FILE_INVOICES.exists():
+        try:
+            return set(json.loads(STATE_FILE_INVOICES.read_text()))
+        except Exception:
+            return set()
+    return set()
+
+def save_processed_invoices(ids):
+    STATE_FILE_INVOICES.parent.mkdir(exist_ok=True)
+    STATE_FILE_INVOICES.write_text(json.dumps(sorted(ids), ensure_ascii=False, indent=2))
 
 # --- API ---
 def fetch_yesterday(base_url):
@@ -105,10 +118,34 @@ def fetch_yesterday(base_url):
         page += 1
     return items
 
+def fetch_last_days(base_url, days=10):
+    now_mad = datetime.now(TZ_MADRID)
+    start_mad = now_mad - timedelta(days=days)
+    start_utc = datetime(start_mad.year, start_mad.month, start_mad.day, 0, 0, 0, tzinfo=TZ_MADRID).astimezone(timezone.utc)
+    end_utc   = now_mad.astimezone(timezone.utc)
+    start_s, end_s = int(start_utc.timestamp()), int(end_utc.timestamp())
+
+    items, page = [], 1
+    while True:
+        params = {"page": page, "limit": PAGE_LIMIT,
+                  "starttmp": str(start_s), "endtmp": str(end_s)}
+        r = requests.get(base_url, headers=headers(), params=params, timeout=60)
+        if r.status_code == 401:
+            raise SystemExit(f"401 Unauthorized: {r.text}")
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < PAGE_LIMIT:
+            break
+        page += 1
+    return items
+
 # --- HTML ---
 def build_html_table(items, date_label, total_day, titulo, subtitulo):
     if not items:
-        return f"<p>No hay {titulo.lower()} AYER ({date_label}).</p>"
+        return f"<p>No hay {titulo.lower()} nuevos hasta {date_label}.</p>"
 
     rows = []
     for d in items:
@@ -129,7 +166,7 @@ def build_html_table(items, date_label, total_day, titulo, subtitulo):
     rows_html = "\n".join(rows)
     return f"""
     <div style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif">
-      <h3 style="margin:0 0 8px">{titulo} de AYER — {date_label}</h3>
+      <h3 style="margin:0 0 8px">{titulo} nuevos — hasta {date_label}</h3>
       <p style="margin:0 0 12px">Total {subtitulo}: <b>{len(items)}</b> &nbsp;|&nbsp; Importe total: <b>{fmt_eur(total_day)}</b></p>
       <table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse">
         <thead><tr><th>Nº</th><th>Cliente</th><th>Total</th><th>Fecha</th></tr></thead>
@@ -176,7 +213,7 @@ def send_email(subject, html):
 
 # --- Print helper ---
 def print_section(items, date_label, titulo):
-    print(f"{titulo} de AYER ({date_label}): {len(items)}\n")
+    print(f"{titulo} — hasta {date_label}: {len(items)}\n")
     total_day = 0.0
     for d in items:
         number   = doc_number(d)
@@ -187,7 +224,7 @@ def print_section(items, date_label, titulo):
         total_day += total
         print(f"{number:>12} | {customer} | {fmt_eur(total):>12} | {fecha_hr}")
     print("\n" + "-"*60)
-    print(f"TOTAL del día (AYER): {fmt_eur(total_day)}")
+    print(f"TOTAL: {fmt_eur(total_day)}")
     print("-"*60)
     return total_day
 
@@ -195,21 +232,30 @@ def print_section(items, date_label, titulo):
 def main():
     date_label = madrid_yesterday_label()
 
-    orders   = fetch_yesterday(BASE_URL_ORDERS)
-    invoices = fetch_yesterday(BASE_URL_INVOICES)
+    # Pedidos de AYER
+    orders = fetch_yesterday(BASE_URL_ORDERS)
+    total_orders = print_section(orders, date_label, "Pedidos")
 
-    total_orders   = print_section(orders, date_label, "Pedidos")
-    total_invoices = print_section(invoices, date_label, "Facturas")
+    # Facturas últimos 10 días
+    invoices_all = fetch_last_days(BASE_URL_INVOICES, days=10)
+    processed_invoices = load_processed_invoices()
+    new_invoices = [inv for inv in invoices_all if doc_number(inv) not in processed_invoices]
+
+    total_invoices = print_section(new_invoices, date_label, "Facturas NUEVAS")
 
     # Email
     html_orders   = build_html_table(orders, date_label, total_orders, "Pedidos", "pedidos")
-    html_invoices = build_html_table(invoices, date_label, total_invoices, "Facturas", "facturas")
+    html_invoices = build_html_table(new_invoices, date_label, total_invoices, "Facturas", "facturas")
 
     html = html_orders + "<br><br>" + html_invoices
-    subject = f"Pedidos ({len(orders)}) y Facturas ({len(invoices)}) — {date_label}"
+    subject = f"Pedidos ({len(orders)}) y Facturas nuevas ({len(new_invoices)}) — {date_label}"
     send_email(subject, html)
 
     print("Email enviado.")
+
+    # Guardar estado de facturas
+    all_ids = processed_invoices.union(doc_number(inv) for inv in invoices_all)
+    save_processed_invoices(all_ids)
 
 if __name__ == "__main__":
     main()
