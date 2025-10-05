@@ -38,6 +38,18 @@ STATE_FILE_INVOICES = Path(".state/processed_invoices.json")
 TZ_MADRID = ZoneInfo("Europe/Madrid")
 
 # --- Helpers ---
+def _as_float(x, default=0.0):
+    """Convierte a float con tolerancia a str/None/locale."""
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip().replace(",", ".")
+        return float(s)
+    except Exception:
+        return default
+
 def headers():
     if not API_KEY:
         raise SystemExit("ERROR: falta HOLDED_API_KEY en variables de entorno")
@@ -68,8 +80,12 @@ def madrid_yesterday_label():
     return (datetime.now(TZ_MADRID) - timedelta(days=1)).strftime("%d/%m/%Y")
 
 def epoch_to_local_str(s):
+    """Convierte epoch (s o ms) a cadena local. Si no es epoch, devuelve str(s)."""
     try:
-        return datetime.fromtimestamp(int(s), tz=timezone.utc).astimezone(TZ_MADRID).strftime("%Y-%m-%d %H:%M:%S")
+        si = int(str(s))
+        if si >= 10**12:  # milisegundos
+            si = si // 1000
+        return datetime.fromtimestamp(int(si), tz=timezone.utc).astimezone(TZ_MADRID).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(s)
 
@@ -83,6 +99,75 @@ def doc_number(d: dict) -> str:
         or d.get("id")
         or "-"
     )
+
+# --- Totales (sin IVA) ---
+def get_subtotal(doc: dict) -> float:
+    """
+    Obtiene la base imponible (sin IVA) de un documento Holded.
+    Estrategia:
+      1) Busca claves típicas en raíz y en 'totals'
+      2) Si no, suma líneas (precio*qty - descuentos)
+      3) Si no, usa total - impuesto
+    """
+    if not isinstance(doc, dict):
+        return 0.0
+
+    candidate_keys = (
+        "subtotal", "subTotal", "taxBase", "base", "baseAmount",
+        "untaxed", "untaxedAmount", "totalNoTax", "total_without_tax",
+        "totalWithoutTax", "net", "netAmount", "amountNet"
+    )
+    # 1) Raíz
+    for k in candidate_keys:
+        if k in doc:
+            return _as_float(doc.get(k))
+
+    # 1b) totals{}
+    totals = doc.get("totals") or {}
+    if isinstance(totals, dict):
+        for k in candidate_keys:
+            if k in totals:
+                return _as_float(totals.get(k))
+
+    # 2) Sumar líneas
+    lines = doc.get("lines") or doc.get("products") or []
+    if isinstance(lines, list) and lines:
+        base_sum = 0.0
+        for ln in lines:
+            if not isinstance(ln, dict):
+                continue
+            # Si la línea trae base, úsala
+            for lk in ("subtotal", "subTotal", "base", "amountNet", "totalNoTax", "net"):
+                if lk in ln:
+                    base_sum += _as_float(ln.get(lk))
+                    break
+            else:
+                price = _as_float(ln.get("price") or ln.get("unitPrice") or ln.get("unit_price") or ln.get("amount"))
+                qty   = _as_float(ln.get("quantity") or ln.get("qty") or ln.get("units") or 1)
+                line  = price * qty
+                # Descuento %
+                disc_pct = _as_float(ln.get("discount") or ln.get("discountRate") or ln.get("discountPercent"))
+                if disc_pct:
+                    line *= (1 - (disc_pct if disc_pct <= 1 else disc_pct/100.0))
+                # Descuento absoluto
+                disc_abs = _as_float(ln.get("discountAmount") or ln.get("discount_amount"))
+                line -= disc_abs
+                if line < 0:
+                    line = 0.0
+                base_sum += line
+        return base_sum
+
+    # 3) total - impuesto
+    total = _as_float(doc.get("total") or (totals.get("total") if isinstance(totals, dict) else 0))
+    tax   = _as_float(
+        doc.get("tax") or doc.get("taxAmount") or doc.get("vatAmount")
+        or (totals.get("tax") if isinstance(totals, dict) else 0)
+        or (totals.get("taxAmount") if isinstance(totals, dict) else 0)
+        or (totals.get("vatAmount") if isinstance(totals, dict) else 0)
+    )
+    if total:
+        return max(total - tax, 0.0)
+    return 0.0
 
 # --- Estado facturas ---
 def load_processed_invoices():
@@ -112,6 +197,8 @@ def fetch_yesterday(base_url):
         batch = r.json()
         if not batch:
             break
+        if isinstance(batch, dict):
+            raise SystemExit(f"Respuesta inesperada de API: {batch}")
         items.extend(batch)
         if len(batch) < PAGE_LIMIT:
             break
@@ -136,6 +223,8 @@ def fetch_last_days(base_url, days=10):
         batch = r.json()
         if not batch:
             break
+        if isinstance(batch, dict):
+            raise SystemExit(f"Respuesta inesperada de API: {batch}")
         items.extend(batch)
         if len(batch) < PAGE_LIMIT:
             break
@@ -143,7 +232,7 @@ def fetch_last_days(base_url, days=10):
     return items
 
 # --- HTML ---
-def build_html_table(items, date_label, total_day, titulo, subtitulo):
+def build_html_table(items, date_label, base_sum, titulo, subtitulo):
     if not items:
         return f"<p>No hay {titulo.lower()} nuevos hasta {date_label}.</p>"
 
@@ -151,14 +240,14 @@ def build_html_table(items, date_label, total_day, titulo, subtitulo):
     for d in items:
         number   = doc_number(d)
         customer = (d.get("customer") or {}).get("name") or d.get("contactName") or "-"
-        total    = float(d.get("total", 0) or 0)
+        subtotal = get_subtotal(d)
         fecha    = d.get("date") or d.get("createdAt") or d.get("issuedOn") or d.get("updatedAt") or "-"
         fecha_hr = epoch_to_local_str(fecha) if str(fecha).isdigit() else fecha
         rows.append(
             f"<tr>"
             f"<td style='white-space:nowrap'>{number}</td>"
             f"<td>{customer}</td>"
-            f"<td style='text-align:right'>{fmt_eur(total)}</td>"
+            f"<td style='text-align:right'>{fmt_eur(subtotal)}</td>"
             f"<td style='white-space:nowrap'>{fecha_hr}</td>"
             f"</tr>"
         )
@@ -167,9 +256,9 @@ def build_html_table(items, date_label, total_day, titulo, subtitulo):
     return f"""
     <div style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif">
       <h3 style="margin:0 0 8px">{titulo} nuevos — hasta {date_label}</h3>
-      <p style="margin:0 0 12px">Total {subtitulo}: <b>{len(items)}</b> &nbsp;|&nbsp; Importe total: <b>{fmt_eur(total_day)}</b></p>
+      <p style="margin:0 0 12px">Total {subtitulo}: <b>{len(items)}</b> &nbsp;|&nbsp; Base imponible total: <b>{fmt_eur(base_sum)}</b></p>
       <table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse">
-        <thead><tr><th>Nº</th><th>Cliente</th><th>Total</th><th>Fecha</th></tr></thead>
+        <thead><tr><th>Nº</th><th>Cliente</th><th>Subtotal (sin IVA)</th><th>Fecha</th></tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>
@@ -214,19 +303,19 @@ def send_email(subject, html):
 # --- Print helper ---
 def print_section(items, date_label, titulo):
     print(f"{titulo} — hasta {date_label}: {len(items)}\n")
-    total_day = 0.0
+    base_sum = 0.0
     for d in items:
         number   = doc_number(d)
         customer = (d.get("customer") or {}).get("name") or d.get("contactName") or "-"
-        total    = float(d.get("total", 0) or 0)
+        subtotal = get_subtotal(d)
         fecha    = d.get("date") or d.get("createdAt") or d.get("issuedOn") or d.get("updatedAt") or "-"
         fecha_hr = epoch_to_local_str(fecha) if str(fecha).isdigit() else fecha
-        total_day += total
-        print(f"{number:>12} | {customer} | {fmt_eur(total):>12} | {fecha_hr}")
+        base_sum += subtotal
+        print(f"{number:>12} | {customer} | {fmt_eur(subtotal):>12} | {fecha_hr}")
     print("\n" + "-"*60)
-    print(f"TOTAL: {fmt_eur(total_day)}")
+    print(f"BASE IMPONIBLE TOTAL: {fmt_eur(base_sum)}")
     print("-"*60)
-    return total_day
+    return base_sum
 
 # --- Main ---
 def main():
@@ -234,18 +323,18 @@ def main():
 
     # Pedidos de AYER
     orders = fetch_yesterday(BASE_URL_ORDERS)
-    total_orders = print_section(orders, date_label, "Pedidos")
+    base_orders = print_section(orders, date_label, "Pedidos")
 
-    # Facturas últimos 10 días
+    # Facturas últimos 10 días (nuevas según estado)
     invoices_all = fetch_last_days(BASE_URL_INVOICES, days=10)
     processed_invoices = load_processed_invoices()
     new_invoices = [inv for inv in invoices_all if doc_number(inv) not in processed_invoices]
 
-    total_invoices = print_section(new_invoices, date_label, "Facturas NUEVAS")
+    base_invoices = print_section(new_invoices, date_label, "Facturas NUEVAS")
 
     # Email
-    html_orders   = build_html_table(orders, date_label, total_orders, "Pedidos", "pedidos")
-    html_invoices = build_html_table(new_invoices, date_label, total_invoices, "Facturas", "facturas")
+    html_orders   = build_html_table(orders, date_label, base_orders, "Pedidos", "pedidos")
+    html_invoices = build_html_table(new_invoices, date_label, base_invoices, "Facturas", "facturas")
 
     html = html_orders + "<br><br>" + html_invoices
     subject = f"Pedidos ({len(orders)}) y Facturas nuevas ({len(new_invoices)}) — {date_label}"
@@ -253,7 +342,7 @@ def main():
 
     print("Email enviado.")
 
-    # Guardar estado de facturas
+    # Guardar estado de facturas (por número/código como antes)
     all_ids = processed_invoices.union(doc_number(inv) for inv in invoices_all)
     save_processed_invoices(all_ids)
 
