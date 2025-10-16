@@ -50,6 +50,24 @@ def _as_float(x, default=0.0):
     except Exception:
         return default
 
+def _norm_text(x):
+    """Normaliza a texto minúscula sin espacios. Si no es convertible, devuelve cadena vacía."""
+    if x is None:
+        return ""
+    try:
+        return str(x).strip().lower()
+    except Exception:
+        return ""
+
+MONTHS_ES = ["", "enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
+
+def month_name_es(dt: datetime) -> str:
+    """Devuelve el nombre del mes en español con mayúscula inicial."""
+    try:
+        return MONTHS_ES[dt.month].capitalize()
+    except Exception:
+        return ""
+
 def headers():
     if not API_KEY:
         raise SystemExit("ERROR: falta HOLDED_API_KEY en variables de entorno")
@@ -182,14 +200,12 @@ def save_processed_invoices(ids):
     STATE_FILE_INVOICES.parent.mkdir(exist_ok=True)
     STATE_FILE_INVOICES.write_text(json.dumps(sorted(ids), ensure_ascii=False, indent=2))
 
-# --- API ---
-def fetch_yesterday(base_url):
-    start_s, end_s = madrid_yesterday_bounds_epoch_seconds()
-    items = []
-    page = 1
+# --- API genérica por rango ---
+def fetch_range(base_url, start_s, end_s):
+    """Obtiene documentos en un rango de tiempo (epoch segundos UTC)."""
+    items, page = [], 1
     while True:
-        params = {"page": page, "limit": PAGE_LIMIT,
-                  "starttmp": str(start_s), "endtmp": str(end_s)}
+        params = {"page": page, "limit": PAGE_LIMIT, "starttmp": str(start_s), "endtmp": str(end_s)}
         r = requests.get(base_url, headers=headers(), params=params, timeout=60)
         if r.status_code == 401:
             raise SystemExit(f"401 Unauthorized: {r.text}")
@@ -204,6 +220,10 @@ def fetch_yesterday(base_url):
             break
         page += 1
     return items
+
+def fetch_yesterday(base_url):
+    start_s, end_s = madrid_yesterday_bounds_epoch_seconds()
+    return fetch_range(base_url, start_s, end_s)
 
 def fetch_last_days(base_url, days=10):
     now_mad = datetime.now(TZ_MADRID)
@@ -211,25 +231,57 @@ def fetch_last_days(base_url, days=10):
     start_utc = datetime(start_mad.year, start_mad.month, start_mad.day, 0, 0, 0, tzinfo=TZ_MADRID).astimezone(timezone.utc)
     end_utc   = now_mad.astimezone(timezone.utc)
     start_s, end_s = int(start_utc.timestamp()), int(end_utc.timestamp())
+    return fetch_range(base_url, start_s, end_s)
 
-    items, page = [], 1
-    while True:
-        params = {"page": page, "limit": PAGE_LIMIT,
-                  "starttmp": str(start_s), "endtmp": str(end_s)}
-        r = requests.get(base_url, headers=headers(), params=params, timeout=60)
-        if r.status_code == 401:
-            raise SystemExit(f"401 Unauthorized: {r.text}")
-        r.raise_for_status()
-        batch = r.json()
-        if not batch:
-            break
-        if isinstance(batch, dict):
-            raise SystemExit(f"Respuesta inesperada de API: {batch}")
-        items.extend(batch)
-        if len(batch) < PAGE_LIMIT:
-            break
-        page += 1
-    return items
+# --- Rangos MTD / YTD ---
+def month_bounds_epoch_seconds_now():
+    now_mad = datetime.now(TZ_MADRID)
+    start_mad = datetime(now_mad.year, now_mad.month, 1, 0, 0, 0, tzinfo=TZ_MADRID)
+    end_mad   = now_mad  # hasta ahora
+    return int(start_mad.astimezone(timezone.utc).timestamp()), int(end_mad.astimezone(timezone.utc).timestamp())
+
+def year_bounds_epoch_seconds_now():
+    now_mad = datetime.now(TZ_MADRID)
+    start_mad = datetime(now_mad.year, 1, 1, 0, 0, 0, tzinfo=TZ_MADRID)
+    end_mad   = now_mad  # hasta ahora
+    return int(start_mad.astimezone(timezone.utc).timestamp()), int(end_mad.astimezone(timezone.utc).timestamp())
+
+# --- Filtro facturas "finalizadas" robusto ---
+def is_invoice_finalized(inv: dict) -> bool:
+    """
+    Consideramos facturas 'válidas' para facturación acumulada si NO están en borrador ni anuladas.
+    Acepta status en texto o codificado como número.
+    """
+    raw = inv.get("status") or inv.get("state") or inv.get("docStatus") or inv.get("statusCode")
+    status_txt = _norm_text(raw)
+
+    # Flags explícitos tipo boolean
+    if any(inv.get(k) in (True, "true", 1, "1") for k in ("cancelled", "canceled", "isCanceled", "void", "voided")):
+        return False
+
+    # Si es numérico: heurística común (ajustable si conoces los códigos de Holded)
+    if isinstance(raw, (int, float)):
+        code = int(raw)
+        if code in (0,):     # borrador
+            return False
+        if code in (9, 99):  # anulada/void
+            return False
+        # otros códigos -> se consideran finalizadas
+
+    # Si es texto, busca tokens típicos
+    if any(tok in status_txt for tok in ("cancel", "anul", "void")):
+        return False
+    if any(tok in status_txt for tok in ("draft", "borrador", "temp")):
+        return False
+
+    return True
+
+def subtotal_sum_finalized(invoices):
+    total = 0.0
+    for inv in invoices:
+        if is_invoice_finalized(inv):
+            total += get_subtotal(inv)
+    return total
 
 # --- HTML ---
 def build_html_table(items, date_label, base_sum, titulo, subtitulo):
@@ -261,6 +313,17 @@ def build_html_table(items, date_label, base_sum, titulo, subtitulo):
         <thead><tr><th>Nº</th><th>Cliente</th><th>Subtotal (sin IVA)</th><th>Fecha</th></tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
+    </div>
+    """
+
+def build_html_summary_mtd_ytd(mtd_total, ytd_total, mes_nombre):
+    return f"""
+    <div style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0 0 16px">
+      <h3 style="margin:0 0 8px">Facturación acumulada (sin IVA)</h3>
+      <ul style="margin:0 0 0 18px;padding:0">
+        <li><b>Mes en curso</b> ({mes_nombre}): <b>{fmt_eur(mtd_total)}</b></li>
+        <li><b>Año en curso</b>: <b>{fmt_eur(ytd_total)}</b></li>
+      </ul>
     </div>
     """
 
@@ -332,11 +395,31 @@ def main():
 
     base_invoices = print_section(new_invoices, date_label, "Facturas NUEVAS")
 
+    # --- Acumulado MTD / YTD (sin IVA) ---
+    # Rango mes en curso
+    m_start_s, m_end_s = month_bounds_epoch_seconds_now()
+    invoices_mtd = fetch_range(BASE_URL_INVOICES, m_start_s, m_end_s)
+    mtd_total = subtotal_sum_finalized(invoices_mtd)
+
+    # Rango año en curso
+    y_start_s, y_end_s = year_bounds_epoch_seconds_now()
+    invoices_ytd = fetch_range(BASE_URL_INVOICES, y_start_s, y_end_s)
+    ytd_total = subtotal_sum_finalized(invoices_ytd)
+
+    # Print resumen MTD/YTD (sin fechas)
+    now_mad = datetime.now(TZ_MADRID)
+    mes_nombre = month_name_es(now_mad)
+
+    print("\nFACTURACIÓN ACUMULADA (sin IVA)")
+    print(f"Mes en curso ({mes_nombre}): {fmt_eur(mtd_total)}")
+    print(f"Año en curso: {fmt_eur(ytd_total)}\n")
+
     # Email
+    html_summary = build_html_summary_mtd_ytd(mtd_total, ytd_total, mes_nombre)
     html_orders   = build_html_table(orders, date_label, base_orders, "Pedidos", "pedidos")
     html_invoices = build_html_table(new_invoices, date_label, base_invoices, "Facturas", "facturas")
 
-    html = html_orders + "<br><br>" + html_invoices
+    html = html_summary + html_orders + "<br><br>" + html_invoices
     subject = f"Pedidos ({len(orders)}) y Facturas nuevas ({len(new_invoices)}) — {date_label}"
     send_email(subject, html)
 
