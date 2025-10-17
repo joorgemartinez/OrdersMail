@@ -27,8 +27,9 @@ SMTP_PORT   = int(os.getenv("SMTP_PORT", "587"))  # 587 STARTTLS | 465 SSL
 SMTP_USER   = os.getenv("SMTP_USER")
 SMTP_PASS   = os.getenv("SMTP_PASS")
 
-BASE_URL_ORDERS   = "https://api.holded.com/api/invoicing/v1/documents/salesorder"
-BASE_URL_INVOICES = "https://api.holded.com/api/invoicing/v1/documents/invoice"
+BASE_URL_ORDERS         = "https://api.holded.com/api/invoicing/v1/documents/salesorder"
+BASE_URL_INVOICES       = "https://api.holded.com/api/invoicing/v1/documents/invoice"
+BASE_URL_CREDIT_NOTES   = "https://api.holded.com/api/invoicing/v1/documents/creditnote"
 PAGE_LIMIT = 200
 
 # Archivos de estado
@@ -118,14 +119,35 @@ def doc_number(d: dict) -> str:
         or "-"
     )
 
-# --- Totales (sin IVA) ---
+def _mark_doc_type(docs, doc_type):
+    """
+    Inserta un tag interno para saber de qué docType vino cada documento.
+    doc_type: 'invoice' | 'creditnote'
+    """
+    for d in docs or []:
+        if isinstance(d, dict):
+            d["_docType"] = doc_type
+    return docs
+
+# --- Detección de abonos (minimalista y exacta para Holded) ---
+def is_credit_note(doc: dict) -> bool:
+    """
+    Consideramos abono si:
+    - Viene del endpoint creditnote (tag _docType = 'creditnote'), o
+    - El número empieza por 'R' (convención R25Lxxx que usáis).
+    """
+    if not isinstance(doc, dict):
+        return False
+    if (doc.get("_docType") or "").lower() == "creditnote":
+        return True
+    num = (doc_number(doc) or "").strip().lower()
+    return num.startswith("r")
+
+# --- Totales (sin IVA) con signo ---
 def get_subtotal(doc: dict) -> float:
     """
-    Obtiene la base imponible (sin IVA) de un documento Holded.
-    Estrategia:
-      1) Busca claves típicas en raíz y en 'totals'
-      2) Si no, suma líneas (precio*qty - descuentos)
-      3) Si no, usa total - impuesto
+    Obtiene la base imponible (sin IVA) de un documento Holded, conservando el signo.
+    Si es abono, devuelve negativo si viniera positivo.
     """
     if not isinstance(doc, dict):
         return 0.0
@@ -138,14 +160,20 @@ def get_subtotal(doc: dict) -> float:
     # 1) Raíz
     for k in candidate_keys:
         if k in doc:
-            return _as_float(doc.get(k))
+            base = _as_float(doc.get(k))
+            if base > 0 and is_credit_note(doc):
+                return -abs(base)
+            return base
 
     # 1b) totals{}
     totals = doc.get("totals") or {}
     if isinstance(totals, dict):
         for k in candidate_keys:
             if k in totals:
-                return _as_float(totals.get(k))
+                base = _as_float(totals.get(k))
+                if base > 0 and is_credit_note(doc):
+                    return -abs(base)
+                return base
 
     # 2) Sumar líneas
     lines = doc.get("lines") or doc.get("products") or []
@@ -154,7 +182,6 @@ def get_subtotal(doc: dict) -> float:
         for ln in lines:
             if not isinstance(ln, dict):
                 continue
-            # Si la línea trae base, úsala
             for lk in ("subtotal", "subTotal", "base", "amountNet", "totalNoTax", "net"):
                 if lk in ln:
                     base_sum += _as_float(ln.get(lk))
@@ -163,19 +190,18 @@ def get_subtotal(doc: dict) -> float:
                 price = _as_float(ln.get("price") or ln.get("unitPrice") or ln.get("unit_price") or ln.get("amount"))
                 qty   = _as_float(ln.get("quantity") or ln.get("qty") or ln.get("units") or 1)
                 line  = price * qty
-                # Descuento %
                 disc_pct = _as_float(ln.get("discount") or ln.get("discountRate") or ln.get("discountPercent"))
                 if disc_pct:
                     line *= (1 - (disc_pct if disc_pct <= 1 else disc_pct/100.0))
-                # Descuento absoluto
                 disc_abs = _as_float(ln.get("discountAmount") or ln.get("discount_amount"))
                 line -= disc_abs
-                if line < 0:
-                    line = 0.0
                 base_sum += line
+        if base_sum > 0 and is_credit_note(doc):
+            return -abs(base_sum)
         return base_sum
 
-    # 3) total - impuesto
+    # 3) total - impuesto (permitiendo negativo)
+    totals = doc.get("totals") or {}
     total = _as_float(doc.get("total") or (totals.get("total") if isinstance(totals, dict) else 0))
     tax   = _as_float(
         doc.get("tax") or doc.get("taxAmount") or doc.get("vatAmount")
@@ -183,9 +209,10 @@ def get_subtotal(doc: dict) -> float:
         or (totals.get("taxAmount") if isinstance(totals, dict) else 0)
         or (totals.get("vatAmount") if isinstance(totals, dict) else 0)
     )
-    if total:
-        return max(total - tax, 0.0)
-    return 0.0
+    base = total - tax
+    if base > 0 and is_credit_note(doc):
+        return -abs(base)
+    return base
 
 # --- Estado facturas ---
 def load_processed_invoices():
@@ -246,41 +273,53 @@ def year_bounds_epoch_seconds_now():
     end_mad   = now_mad  # hasta ahora
     return int(start_mad.astimezone(timezone.utc).timestamp()), int(end_mad.astimezone(timezone.utc).timestamp())
 
-# --- Filtro facturas "finalizadas" robusto ---
+# --- Filtros de estado ---
+def is_invoice_draft(inv: dict) -> bool:
+    """Detecta 'borrador' (texto o código 0)."""
+    raw = inv.get("status") or inv.get("state") or inv.get("docStatus") or inv.get("statusCode")
+    txt = _norm_text(raw)
+    if isinstance(raw, (int, float)) and int(raw) == 0:
+        return True
+    return any(tok in txt for tok in ("draft", "borrador", "temp"))
+
 def is_invoice_finalized(inv: dict) -> bool:
     """
-    Consideramos facturas 'válidas' para facturación acumulada si NO están en borrador ni anuladas.
-    Acepta status en texto o codificado como número.
+    Consideramos 'válida' si NO está en borrador ni anulada.
+    (Para abonos usamos is_credit_note + is_invoice_draft).
     """
     raw = inv.get("status") or inv.get("state") or inv.get("docStatus") or inv.get("statusCode")
     status_txt = _norm_text(raw)
 
-    # Flags explícitos tipo boolean
     if any(inv.get(k) in (True, "true", 1, "1") for k in ("cancelled", "canceled", "isCanceled", "void", "voided")):
         return False
 
-    # Si es numérico: heurística común (ajustable si conoces los códigos de Holded)
     if isinstance(raw, (int, float)):
         code = int(raw)
         if code in (0,):     # borrador
             return False
         if code in (9, 99):  # anulada/void
             return False
-        # otros códigos -> se consideran finalizadas
 
-    # Si es texto, busca tokens típicos
     if any(tok in status_txt for tok in ("cancel", "anul", "void")):
         return False
     if any(tok in status_txt for tok in ("draft", "borrador", "temp")):
         return False
-
     return True
 
 def subtotal_sum_finalized(invoices):
+    """
+    Suma bases imponibles con signo.
+    - Abonos: se incluyen salvo que estén en borrador.
+    - Facturas normales: se incluyen si no están en borrador/anuladas.
+    """
     total = 0.0
     for inv in invoices:
-        if is_invoice_finalized(inv):
-            total += get_subtotal(inv)
+        if is_credit_note(inv):
+            if not is_invoice_draft(inv):
+                total += get_subtotal(inv)
+        else:
+            if is_invoice_finalized(inv):
+                total += get_subtotal(inv)
     return total
 
 # --- HTML ---
@@ -321,7 +360,7 @@ def build_html_summary_mtd_ytd(mtd_total, ytd_total, mes_nombre):
     <div style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0 0 16px">
       <h3 style="margin:0 0 8px">Facturación acumulada (sin IVA)</h3>
       <ul style="margin:0 0 0 18px;padding:0">
-        <li><b>Mes en curso</b> ({mes_nombre}): <b>{fmt_eur(mtd_total)}</b></li>
+        <li><b>Mes en curso ({mes_nombre})</b>: <b>{fmt_eur(mtd_total)}</b></li>
         <li><b>Año en curso</b>: <b>{fmt_eur(ytd_total)}</b></li>
       </ul>
     </div>
@@ -388,23 +427,31 @@ def main():
     orders = fetch_yesterday(BASE_URL_ORDERS)
     base_orders = print_section(orders, date_label, "Pedidos")
 
-    # Facturas últimos 10 días (nuevas según estado)
-    invoices_all = fetch_last_days(BASE_URL_INVOICES, days=10)
-    processed_invoices = load_processed_invoices()
-    new_invoices = [inv for inv in invoices_all if doc_number(inv) not in processed_invoices]
+    # Facturas y abonos "nuevos" (últimos 10 días) — combinados
+    invoices_10d = fetch_last_days(BASE_URL_INVOICES, days=10)
+    creditnotes_10d = fetch_last_days(BASE_URL_CREDIT_NOTES, days=10)
+    _mark_doc_type(invoices_10d, "invoice")
+    _mark_doc_type(creditnotes_10d, "creditnote")
+    docs_10d = invoices_10d + creditnotes_10d
 
-    base_invoices = print_section(new_invoices, date_label, "Facturas NUEVAS")
+    processed_invoices = load_processed_invoices()
+    new_docs = [inv for inv in docs_10d if doc_number(inv) not in processed_invoices]
+    base_invoices = print_section(new_docs, date_label, "Facturas/Abonos NUEVOS")
 
     # --- Acumulado MTD / YTD (sin IVA) ---
-    # Rango mes en curso
     m_start_s, m_end_s = month_bounds_epoch_seconds_now()
-    invoices_mtd = fetch_range(BASE_URL_INVOICES, m_start_s, m_end_s)
-    mtd_total = subtotal_sum_finalized(invoices_mtd)
+    invoices_mtd     = fetch_range(BASE_URL_INVOICES, m_start_s, m_end_s)
+    creditnotes_mtd  = fetch_range(BASE_URL_CREDIT_NOTES, m_start_s, m_end_s)
+    _mark_doc_type(invoices_mtd, "invoice")
+    _mark_doc_type(creditnotes_mtd, "creditnote")
+    mtd_total = subtotal_sum_finalized(invoices_mtd + creditnotes_mtd)
 
-    # Rango año en curso
     y_start_s, y_end_s = year_bounds_epoch_seconds_now()
-    invoices_ytd = fetch_range(BASE_URL_INVOICES, y_start_s, y_end_s)
-    ytd_total = subtotal_sum_finalized(invoices_ytd)
+    invoices_ytd     = fetch_range(BASE_URL_INVOICES, y_start_s, y_end_s)
+    creditnotes_ytd  = fetch_range(BASE_URL_CREDIT_NOTES, y_start_s, y_end_s)
+    _mark_doc_type(invoices_ytd, "invoice")
+    _mark_doc_type(creditnotes_ytd, "creditnote")
+    ytd_total = subtotal_sum_finalized(invoices_ytd + creditnotes_ytd)
 
     # Print resumen MTD/YTD (sin fechas)
     now_mad = datetime.now(TZ_MADRID)
@@ -417,16 +464,16 @@ def main():
     # Email
     html_summary = build_html_summary_mtd_ytd(mtd_total, ytd_total, mes_nombre)
     html_orders   = build_html_table(orders, date_label, base_orders, "Pedidos", "pedidos")
-    html_invoices = build_html_table(new_invoices, date_label, base_invoices, "Facturas", "facturas")
+    html_invoices = build_html_table(new_docs, date_label, base_invoices, "Facturas/Abonos", "documentos")
 
     html = html_summary + html_orders + "<br><br>" + html_invoices
-    subject = f"Pedidos ({len(orders)}) y Facturas nuevas ({len(new_invoices)}) — {date_label}"
+    subject = f"Total Pedidos y Facturas {date_label}"
     send_email(subject, html)
 
     print("Email enviado.")
 
-    # Guardar estado de facturas (por número/código como antes)
-    all_ids = processed_invoices.union(doc_number(inv) for inv in invoices_all)
+    # Guardar estado (por número/código como antes)
+    all_ids = processed_invoices.union(doc_number(inv) for inv in docs_10d)
     save_processed_invoices(all_ids)
 
 if __name__ == "__main__":
